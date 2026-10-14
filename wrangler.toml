@@ -1,4 +1,4 @@
-name = "bdjob-api"
+name = "bdjob-worker"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
 
