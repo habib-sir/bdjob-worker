@@ -30,16 +30,19 @@ export default {
     }
 
     const updatedAt = new Date().toISOString();
-    const posts = jobs.slice(0, 50).map((j) => ({
-      id: j.id,
-      title: j.title || "",
-      slug: j.slug || j.id,
-      category: j.category || "govt",
-      deadline: j.deadline,
-      publishedAt: j.publishedAt,
-      applyServiceEnabled: Boolean(j.applyServiceEnabled),
-      featuredImage: j.featuredImage || j.circularImages?.[0] || null,
-    }));
+    const posts = jobs
+      .filter((j) => j.status !== "draft")
+      .slice(0, 50)
+      .map((j) => ({
+        id: j.id,
+        title: j.title || "",
+        slug: j.slug || j.id,
+        category: j.category || "govt",
+        deadline: j.deadline,
+        publishedAt: j.publishedAt,
+        applyServiceEnabled: Boolean(j.applyServiceEnabled),
+        featuredImage: j.featuredImage || j.circularImages?.[0] || null,
+      }));
 
     const opts = { httpMetadata: { contentType: "application/json" } };
     await env.BUCKET.put("jobs.json", JSON.stringify(jobs, null, 2), opts);
