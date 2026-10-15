@@ -5,3 +5,7 @@ compatibility_date = "2026-01-01"
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "bdjob-files"
+
+[[r2_buckets]]
+binding = "PRIVATE"
+bucket_name = "bdjob-private"
