@@ -8,6 +8,7 @@ const MAX_PUBLIC_JSON_BYTES = 100000;
 // অ্যাডমিন যে public JSON ফাইলগুলো লিখতে পারবে (নাম -> R2 ফাইল)
 const PUBLIC_JSON_FILES = {
   "settings-payment": "settings-payment.json",
+  "exams": "exams.json",
 };
 
 function cors(extra = {}) {
