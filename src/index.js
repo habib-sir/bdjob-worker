@@ -4,12 +4,17 @@ const ADMIN_EMAILS = ["habiblinkage@gmail.com", "masterboom2040@gmail.com"];
 const DEFAULT_FIREBASE_API_KEY = "AIzaSyC2SQchoqvoeEhtMhZo2Uhvs9sjiQziYso";
 const MAX_PROFILE_BYTES = 300000;
 const MAX_PUBLIC_JSON_BYTES = 100000;
+const MAX_UPLOAD_BYTES = 500000;
 
 // অ্যাডমিন যে public JSON ফাইলগুলো লিখতে পারবে (নাম -> R2 ফাইল)
 const PUBLIC_JSON_FILES = {
   "settings-payment": "settings-payment.json",
   "exams": "exams.json",
 };
+
+// অ্যাডমিন যে ফোল্ডারে ছবি আপলোড করতে পারবে
+const UPLOAD_FOLDERS = ["exams"];
+const IMAGE_TYPES = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
 
 function cors(extra = {}) {
   return {
@@ -107,7 +112,7 @@ export default {
       return json({ ok: true, count: jobs.length });
     }
 
-    // ---------- পাবলিক সেটিংস লেখা (অ্যাডমিন টোকেন) ----------
+    // ---------- পাবলিক JSON লেখা (অ্যাডমিন টোকেন) ----------
     const publicMatch = path.match(/^\/admin\/public\/([a-z-]+)$/);
     if (publicMatch && request.method === "PUT") {
       if (!isAdminToken) return text("Unauthorized", 401);
@@ -130,6 +135,28 @@ export default {
         },
       });
       return json({ ok: true });
+    }
+
+    // ---------- পাবলিক ছবি আপলোড (অ্যাডমিন টোকেন) ----------
+    const uploadMatch = path.match(/^\/admin\/upload\/([a-z]+)\/([a-z0-9-]+\.(?:jpg|png|webp))$/);
+    if (uploadMatch && request.method === "PUT") {
+      if (!isAdminToken) return text("Unauthorized", 401);
+
+      const [, folder, file] = uploadMatch;
+      if (!UPLOAD_FOLDERS.includes(folder)) return text("Unknown folder", 404);
+
+      const type = (request.headers.get("Content-Type") || "").split(";")[0];
+      const ext = IMAGE_TYPES[type];
+      if (!ext || !file.endsWith("." + ext)) return text("Bad image type", 400);
+
+      const buf = await request.arrayBuffer();
+      if (buf.byteLength > MAX_UPLOAD_BYTES) return text("Too large", 413);
+
+      const key = `${folder}/${file}`;
+      await env.BUCKET.put(key, buf, {
+        httpMetadata: { contentType: type, cacheControl: "public, max-age=3600" },
+      });
+      return json({ ok: true, url: `https://files.bdjobapply.site/${key}` });
     }
 
     // ---------- নিজের সিভি (প্রাইভেট bucket) ----------
