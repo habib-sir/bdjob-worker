@@ -6,6 +6,9 @@ const MAX_PROFILE_BYTES = 300000;
 const MAX_PUBLIC_JSON_BYTES = 100000;
 const MAX_UPLOAD_BYTES = 500000;
 const MAX_FILE_CHARS = 1400000;
+const MAX_APPLICATION_CHARS = 60000;
+
+const APP_STATUSES = ["waiting", "apply_now", "checking", "correction", "payment_now", "applied", "rejected"];
 
 // অ্যাডমিন যে public JSON ফাইলগুলো লিখতে পারবে (নাম -> R2 ফাইল)
 const PUBLIC_JSON_FILES = {
@@ -21,7 +24,7 @@ function cors(extra = {}) {
   return {
     "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
     "Access-Control-Allow-Headers": "Authorization, Content-Type",
-    "Access-Control-Allow-Methods": "GET, PUT, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, PUT, POST, PATCH, DELETE, OPTIONS",
     ...extra,
   };
 }
@@ -62,6 +65,231 @@ async function verifyUser(request, env) {
 
 const isAdminUser = (u) => !!u && ADMIN_EMAILS.includes(u.email);
 
+async function requireAdmin(request, env) {
+  const user = await verifyUser(request, env);
+  return isAdminUser(user) ? user : null;
+}
+
+// ---------- আবেদন (D1) ----------
+
+function dateCode(d = new Date()) {
+  const yy = String(d.getUTCFullYear()).slice(-2);
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yy}${mm}${dd}`;
+}
+
+const isValidMobile = (m) => /^01[3-9]\d{8}$/.test(String(m || ""));
+
+async function readJobs(env) {
+  const obj = await env.BUCKET.get("jobs.json");
+  return obj ? await obj.json() : [];
+}
+
+// POST /api/applications (ব্যবহারকারী)
+async function handleSubmitApplication(request, env, user) {
+  const raw = await request.text();
+  if (raw.length > MAX_APPLICATION_CHARS) return text("Too large", 413);
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return text("Invalid JSON", 400);
+  }
+
+  const jobId = String(body.jobId || "");
+  const postName = String(body.postName || "").trim();
+  const smsNumber = String(body.smsNumber || "");
+  if (!jobId || !postName) return text("জব ও পদ লাগবে", 400);
+  if (!isValidMobile(smsNumber)) return text("সঠিক মোবাইল নম্বর দিন", 400);
+
+  // জব ও পদ সার্ভার থেকে যাচাই (ফি ও নিয়ম সার্ভারে গণনা)
+  const jobs = await readJobs(env);
+  const job = jobs.find((j) => j.id === jobId || j.slug === jobId);
+  if (!job) return text("চাকরির বিজ্ঞপ্তিটি পাওয়া যায়নি", 404);
+  if (job.status === "draft") return text("এই বিজ্ঞপ্তিতে এখন আবেদন নেওয়া হচ্ছে না", 400);
+  if (job.deadline && new Date(job.deadline).getTime() < Date.now()) {
+    return text("আবেদনের শেষ সময় পার হয়ে গেছে", 400);
+  }
+  const post = (job.posts || []).find((p) => p.name === postName);
+  if (!post) return text("এই পদটি বিজ্ঞপ্তিতে নেই", 400);
+
+  // একই সার্কুলারে একাধিক পদ: শুধু চালু থাকলে অনুমোদিত
+  if (!job.allowMultiplePosts) {
+    const existing = await env.DB.prepare(
+      "SELECT id FROM applications WHERE uid = ? AND job_id = ? LIMIT 1"
+    ).bind(user.uid, job.id).first();
+    if (existing) {
+      return text("এই সার্কুলারে ইতিপূর্বে আপনি আবেদন করেছেন", 409);
+    }
+  }
+
+  const appFee = Number(post.applicationFee ?? job.applicationFee ?? 0) || 0;
+  const serviceCharge = Number(post.serviceCharge ?? job.serviceCharge ?? 10) || 0;
+  const now = new Date().toISOString();
+
+  // আবেদন নম্বর: APL-YYMMDD-NNNN (দিনভিত্তিক ক্রম, একই সময়ে নিরাপদ)
+  const code = dateCode();
+  const counter = await env.DB.prepare(
+    "INSERT INTO counters (key, value) VALUES (?, 1) ON CONFLICT(key) DO UPDATE SET value = value + 1 RETURNING value"
+  ).bind(`app_${code}`).first();
+  const id = `APL-${code}-${String(counter.value).padStart(4, "0")}`;
+
+  const data = {
+    jobTitle: job.title || "",
+    applyLink: job.applyLink || "",
+    postCount: post.count || 1,
+    district: body.district || "",
+    educationLevel: body.educationLevel || "",
+    fee: { applicationFee: appFee, serviceCharge, total: appFee + serviceCharge },
+    payment: {
+      method: body.payment?.method || "",
+      senderNumber: String(body.payment?.senderNumber || ""),
+      amount: appFee + serviceCharge,
+      submittedAt: now,
+    },
+    hasScreenshot: Boolean(body.hasScreenshot),
+    fullName: String(body.fullName || "").slice(0, 200),
+  };
+
+  try {
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO applications (id, uid, job_id, post_name, full_name, mobile, status, data, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'waiting', ?, ?, ?)`
+      ).bind(id, user.uid, job.id, postName, data.fullName, smsNumber, JSON.stringify(data), now, now),
+      env.DB.prepare("UPDATE application_stats SET total = total + 1 WHERE status = 'waiting'"),
+    ]);
+  } catch (err) {
+    if (String(err?.message || err).includes("UNIQUE")) {
+      return text("এই পদে ইতিপূর্বে আপনি আবেদন করেছেন", 409);
+    }
+    console.error("Application insert failed:", err);
+    return text("আবেদন সংরক্ষণ ব্যর্থ হয়েছে। আবার চেষ্টা করুন।", 500);
+  }
+
+  return json({ ok: true, application: { id, status: "waiting", createdAt: now } });
+}
+
+// GET /api/applications/my (ব্যবহারকারী, নিজের আবেদন)
+async function handleMyApplications(env, user) {
+  const rs = await env.DB.prepare(
+    "SELECT id, job_id, post_name, status, created_at, updated_at, data FROM applications WHERE uid = ? ORDER BY created_at DESC LIMIT 200"
+  ).bind(user.uid).all();
+
+  const items = (rs.results || []).map((r) => ({
+    id: r.id,
+    jobId: r.job_id,
+    postName: r.post_name,
+    status: r.status,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    ...(JSON.parse(r.data || "{}")),
+  }));
+  return json({ items });
+}
+
+// GET /api/admin/applications?status=waiting,checking&page=1&limit=50&q=...
+async function handleAdminList(url, env) {
+  const statusParam = url.searchParams.get("status") || "waiting";
+  const statuses = statusParam.split(",").filter((s) => APP_STATUSES.includes(s));
+  if (statuses.length === 0) return text("Bad status", 400);
+
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 1), 100);
+  const page = Math.max(parseInt(url.searchParams.get("page") || "1", 10) || 1, 1);
+  const offset = (page - 1) * limit;
+  const q = (url.searchParams.get("q") || "").trim().slice(0, 100);
+
+  let sql = `SELECT id, uid, job_id, post_name, full_name, mobile, status, created_at, updated_at
+             FROM applications WHERE status IN (${statuses.map(() => "?").join(",")})`;
+  const binds = [...statuses];
+  if (q) {
+    sql += " AND (id LIKE ? OR mobile LIKE ? OR full_name LIKE ?)";
+    const like = `%${q}%`;
+    binds.push(like, like, like);
+  }
+  sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
+  binds.push(limit + 1, offset);
+
+  const rs = await env.DB.prepare(sql).bind(...binds).all();
+  const rows = rs.results || [];
+  const hasNext = rows.length > limit;
+
+  return json({
+    items: rows.slice(0, limit).map((r) => ({
+      id: r.id,
+      uid: r.uid,
+      jobId: r.job_id,
+      postName: r.post_name,
+      fullName: r.full_name,
+      mobile: r.mobile,
+      status: r.status,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    })),
+    page,
+    limit,
+    hasNext,
+  });
+}
+
+// GET /api/admin/applications/:id
+async function handleAdminDetail(id, env) {
+  const row = await env.DB.prepare("SELECT * FROM applications WHERE id = ?").bind(id).first();
+  if (!row) return text("Not found", 404);
+  return json({
+    id: row.id,
+    uid: row.uid,
+    jobId: row.job_id,
+    postName: row.post_name,
+    fullName: row.full_name,
+    mobile: row.mobile,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...JSON.parse(row.data || "{}"),
+  });
+}
+
+// PATCH /api/admin/applications/:id  { status?, data? }
+async function handleAdminPatch(id, request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return text("Invalid JSON", 400);
+  }
+
+  const row = await env.DB.prepare("SELECT status, data FROM applications WHERE id = ?").bind(id).first();
+  if (!row) return text("Not found", 404);
+
+  const nextStatus = body.status && APP_STATUSES.includes(body.status) ? body.status : row.status;
+  const merged = { ...JSON.parse(row.data || "{}"), ...(body.data && typeof body.data === "object" ? body.data : {}) };
+  const now = new Date().toISOString();
+
+  const statements = [
+    env.DB.prepare("UPDATE applications SET status = ?, data = ?, updated_at = ? WHERE id = ?")
+      .bind(nextStatus, JSON.stringify(merged), now, id),
+  ];
+  if (nextStatus !== row.status) {
+    statements.push(
+      env.DB.prepare("UPDATE application_stats SET total = total - 1 WHERE status = ?").bind(row.status),
+      env.DB.prepare("UPDATE application_stats SET total = total + 1 WHERE status = ?").bind(nextStatus)
+    );
+  }
+  await env.DB.batch(statements);
+
+  return json({ ok: true, id, status: nextStatus, updatedAt: now });
+}
+
+// GET /api/admin/stats (ড্যাশবোর্ড সংখ্যা, খুব কম read)
+async function handleAdminStats(env) {
+  const rs = await env.DB.prepare("SELECT status, total FROM application_stats").all();
+  const stats = {};
+  for (const r of rs.results || []) stats[r.status] = r.total;
+  return json({ stats });
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
@@ -71,6 +299,40 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const isAdminToken = request.headers.get("Authorization") === `Bearer ${env.ADMIN_TOKEN}`;
+
+    // ---------- আবেদন: ব্যবহারকারী ----------
+    if (path === "/api/applications" && request.method === "POST") {
+      const user = await verifyUser(request, env);
+      if (!user) return text("Unauthorized", 401);
+      return handleSubmitApplication(request, env, user);
+    }
+
+    if (path === "/api/applications/my" && request.method === "GET") {
+      const user = await verifyUser(request, env);
+      if (!user) return text("Unauthorized", 401);
+      return handleMyApplications(env, user);
+    }
+
+    // ---------- আবেদন: অ্যাডমিন ----------
+    if (path === "/api/admin/applications" && request.method === "GET") {
+      if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
+      return handleAdminList(url, env);
+    }
+
+    const adminAppMatch = path.match(/^\/api\/admin\/applications\/([A-Za-z0-9-]{4,60})$/);
+    if (adminAppMatch && request.method === "GET") {
+      if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
+      return handleAdminDetail(adminAppMatch[1], env);
+    }
+    if (adminAppMatch && request.method === "PATCH") {
+      if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
+      return handleAdminPatch(adminAppMatch[1], request, env);
+    }
+
+    if (path === "/api/admin/stats" && request.method === "GET") {
+      if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
+      return handleAdminStats(env);
+    }
 
     // ---------- জব সেভ (অ্যাডমিন টোকেন) ----------
     if (path === "/admin/jobs/save" && request.method === "POST") {
