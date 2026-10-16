@@ -5,6 +5,7 @@ const DEFAULT_FIREBASE_API_KEY = "AIzaSyC2SQchoqvoeEhtMhZo2Uhvs9sjiQziYso";
 const MAX_PROFILE_BYTES = 300000;
 const MAX_PUBLIC_JSON_BYTES = 100000;
 const MAX_UPLOAD_BYTES = 500000;
+const MAX_FILE_CHARS = 1400000;
 
 // অ্যাডমিন যে public JSON ফাইলগুলো লিখতে পারবে (নাম -> R2 ফাইল)
 const PUBLIC_JSON_FILES = {
@@ -28,7 +29,7 @@ function cors(extra = {}) {
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: cors({ "Content-Type": "application/json" }),
+    headers: cors({ "Content-Type": "application/json", "Cache-Control": "no-store" }),
   });
 }
 
@@ -157,6 +158,90 @@ export default {
         httpMetadata: { contentType: type, cacheControl: "public, max-age=3600" },
       });
       return json({ ok: true, url: `https://files.bdjobapply.site/${key}` });
+    }
+
+    // ---------- কভার ইমেজ (অ্যাডমিন ইমেইল, পাবলিক R2) ----------
+    const coverMatch = path.match(/^\/cover\/([A-Za-z0-9_-]{3,160})$/);
+    if (coverMatch && request.method === "PUT") {
+      const user = await verifyUser(request, env);
+      if (!isAdminUser(user)) return text("Forbidden", 403);
+
+      const body = await request.text();
+      if (body.length > MAX_FILE_CHARS) return text("Too large", 413);
+      let doc;
+      try {
+        doc = JSON.parse(body);
+      } catch {
+        return text("Invalid JSON", 400);
+      }
+      if (doc.kind !== "cover" || typeof doc.data !== "string") return text("Bad body", 400);
+
+      await env.BUCKET.put(`files/${coverMatch[1]}.json`, body, {
+        httpMetadata: {
+          contentType: "application/json",
+          cacheControl: "public, max-age=3600",
+        },
+      });
+      return json({ ok: true });
+    }
+
+    // ---------- প্রাইভেট ফাইল: ছবি, স্বাক্ষর, স্ক্রিনশট, সফট/পেইড কপি ----------
+    const fileMatch = path.match(/^\/file\/([A-Za-z0-9_-]{3,160})$/);
+    if (fileMatch) {
+      const user = await verifyUser(request, env);
+      if (!user) return text("Unauthorized", 401);
+
+      const admin = isAdminUser(user);
+      const key = `files/${fileMatch[1]}.json`;
+
+      if (request.method === "GET") {
+        const obj = await env.PRIVATE.get(key);
+        if (!obj) return text("Not found", 404);
+        const doc = await obj.json();
+        if (!admin && doc.ownerUid !== user.uid) return text("Forbidden", 403);
+        return json(doc);
+      }
+
+      if (request.method === "PUT") {
+        const body = await request.text();
+        if (body.length > MAX_FILE_CHARS) return text("Too large", 413);
+        let doc;
+        try {
+          doc = JSON.parse(body);
+        } catch {
+          return text("Invalid JSON", 400);
+        }
+        if (typeof doc.data !== "string" || typeof doc.ownerUid !== "string") {
+          return text("Bad body", 400);
+        }
+        if (!admin) {
+          // সাধারণ ব্যবহারকারী শুধু নিজের ফাইল লিখতে পারবে
+          if (doc.ownerUid !== user.uid) return text("Forbidden", 403);
+          const old = await env.PRIVATE.get(key);
+          if (old) {
+            const oldDoc = await old.json();
+            if (oldDoc.ownerUid !== user.uid) return text("Forbidden", 403);
+          }
+        }
+        await env.PRIVATE.put(key, body, {
+          httpMetadata: { contentType: "application/json" },
+        });
+        return json({ ok: true });
+      }
+
+      if (request.method === "DELETE") {
+        if (!admin) {
+          const old = await env.PRIVATE.get(key);
+          if (old) {
+            const oldDoc = await old.json();
+            if (oldDoc.ownerUid !== user.uid) return text("Forbidden", 403);
+          }
+        }
+        await env.PRIVATE.delete(key);
+        return json({ ok: true });
+      }
+
+      return text("Method not allowed", 405);
     }
 
     // ---------- নিজের সিভি (প্রাইভেট bucket) ----------
