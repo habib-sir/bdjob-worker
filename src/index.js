@@ -2,21 +2,25 @@ const ALLOWED_ORIGIN = "https://bdjobapply.site";
 const ADMIN_EMAILS = ["habiblinkage@gmail.com", "masterboom2040@gmail.com"];
 // Firebase Web API key প্রকাশ্য (frontend-এও থাকে), তাই এটি গোপন নয়
 const DEFAULT_FIREBASE_API_KEY = "AIzaSyC2SQchoqvoeEhtMhZo2Uhvs9sjiQziYso";
+const DEFAULT_FIREBASE_PROJECT_ID = "gen-lang-client-0467244762";
+const DEFAULT_USER_EMAIL_DOMAIN = "@users.app.local";
 const MAX_PROFILE_BYTES = 300000;
 const MAX_PUBLIC_JSON_BYTES = 100000;
 const MAX_UPLOAD_BYTES = 500000;
 const MAX_FILE_CHARS = 1400000;
 const MAX_APPLICATION_CHARS = 60000;
+const RESET_MAX_FAILS = 5;
+const RESET_BLOCK_MS = 30 * 60 * 1000;
+const URGENT_MS = 2 * 24 * 60 * 60 * 1000;
 
-const APP_STATUSES = ["waiting", "apply_now", "checking", "correction", "payment_now", "applied", "rejected"];
+const APP_STATUSES = ["waiting", "apply_now", "checking", "correction", "payment_now", "applied", "rejected", "cancelled"];
+const OPEN_STATUSES = ["waiting", "apply_now", "checking", "correction", "payment_now"];
 
-// অ্যাডমিন যে public JSON ফাইলগুলো লিখতে পারবে (নাম -> R2 ফাইল)
 const PUBLIC_JSON_FILES = {
   "settings-payment": "settings-payment.json",
   "exams": "exams.json",
 };
 
-// অ্যাডমিন যে ফোল্ডারে ছবি আপলোড করতে পারবে
 const UPLOAD_FOLDERS = ["exams"];
 const IMAGE_TYPES = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
 
@@ -40,7 +44,12 @@ function text(msg, status = 200) {
   return new Response(msg, { status, headers: cors() });
 }
 
-// Firebase ID token যাচাই (Firestore লাগে না, শুধু Auth)
+const isValidMobile = (m) => /^01[3-9]\d{8}$/.test(String(m || ""));
+
+function projectIdOf(env) {
+  return env.FIREBASE_PROJECT_ID || DEFAULT_FIREBASE_PROJECT_ID;
+}
+
 async function verifyUser(request, env) {
   const header = request.headers.get("Authorization") || "";
   const idToken = header.startsWith("Bearer ") ? header.slice(7) : "";
@@ -70,8 +79,189 @@ async function requireAdmin(request, env) {
   return isAdminUser(user) ? user : null;
 }
 
-// ---------- আবেদন (D1) ----------
+// ---------- Google সার্ভিস অ্যাকাউন্ট ----------
+function b64url(buf) {
+  let s = "";
+  const bytes = new Uint8Array(buf);
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
 
+function strB64url(s) {
+  return b64url(new TextEncoder().encode(s));
+}
+
+function pemToDer(pem) {
+  const b64 = pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}
+
+async function signSaJwt(env, payload) {
+  const header = strB64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const body = strB64url(JSON.stringify(payload));
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    pemToDer(env.FIREBASE_SA_PRIVATE_KEY),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    new TextEncoder().encode(`${header}.${body}`)
+  );
+  return `${header}.${body}.${b64url(sig)}`;
+}
+
+async function getGoogleAccessToken(env) {
+  const now = Math.floor(Date.now() / 1000);
+  const assertion = await signSaJwt(env, {
+    iss: env.FIREBASE_SA_EMAIL,
+    scope: "https://www.googleapis.com/auth/cloud-platform",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+  });
+
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${assertion}`,
+  });
+  if (!res.ok) throw new Error("Google token লাগানো যায়নি");
+  return (await res.json()).access_token;
+}
+
+async function createCustomToken(env, uid) {
+  const now = Math.floor(Date.now() / 1000);
+  return signSaJwt(env, {
+    iss: env.FIREBASE_SA_EMAIL,
+    sub: env.FIREBASE_SA_EMAIL,
+    aud: "https://identitytoolkit.googleapis.com/google.identity.identitytoolkit.v1.IdentityToolkit",
+    iat: now,
+    exp: now + 3600,
+    uid,
+  });
+}
+
+async function lookupUserByMobile(env, mobile) {
+  const domain = env.USER_EMAIL_DOMAIN || DEFAULT_USER_EMAIL_DOMAIN;
+  const email = `${mobile}${domain}`;
+  const token = await getGoogleAccessToken(env);
+  const res = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/projects/${projectIdOf(env)}/accounts:lookup`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ email: [email] }),
+    }
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  return (data.users && data.users[0]) || null;
+}
+
+async function setAuthPassword(env, uid, password) {
+  const token = await getGoogleAccessToken(env);
+  const res = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/projects/${projectIdOf(env)}/accounts:update`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ localId: uid, password }),
+    }
+  );
+  if (!res.ok) throw new Error(`পাসওয়ার্ড বদলানো যায়নি (HTTP ${res.status})`);
+}
+
+// ---------- মাস্টার পাসওয়ার্ড (লগ বা সীমা নেই) ----------
+function safeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function checkMaster(env, given) {
+  return !!env.MASTER_PASSWORD && safeEqual(String(given || ""), env.MASTER_PASSWORD);
+}
+
+// ---------- জন্মতারিখ রিসেট: ভুল চেষ্টার সীমা ----------
+async function rateOk(env, key) {
+  const row = await env.DB.prepare("SELECT blocked_until FROM reset_attempts WHERE key = ?").bind(key).first();
+  return !(row && row.blocked_until > Date.now());
+}
+
+async function recordFail(env, key) {
+  const until = Date.now() + RESET_BLOCK_MS;
+  await env.DB.prepare(
+    `INSERT INTO reset_attempts (key, count, blocked_until) VALUES (?, 1, 0)
+     ON CONFLICT(key) DO UPDATE SET
+       count = count + 1,
+       blocked_until = CASE WHEN count + 1 >= ? THEN ? ELSE blocked_until END`
+  ).bind(key, RESET_MAX_FAILS, until).run();
+}
+
+async function clearFail(env, key) {
+  await env.DB.prepare("DELETE FROM reset_attempts WHERE key = ?").bind(key).run();
+}
+
+function normDob(v) {
+  const s = String(v || "").trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : s;
+}
+
+// ---------- ধাপের মোবাইল-তালিকা (প্রাইভেট bucket, অ্যাডমিন দেখে) ----------
+const pipelineKey = (status) => `pipeline/${status}.txt`;
+
+async function readPipeline(env, status) {
+  const obj = await env.PRIVATE.get(pipelineKey(status));
+  if (!obj) return [];
+  const raw = await obj.text();
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+async function writePipeline(env, status, numbers) {
+  await env.PRIVATE.put(pipelineKey(status), [...new Set(numbers)].join(", "), {
+    httpMetadata: { contentType: "text/plain; charset=utf-8" },
+  });
+}
+
+async function addToPipeline(env, status, mobile) {
+  const list = await readPipeline(env, status);
+  if (!list.includes(mobile)) list.push(mobile);
+  await writePipeline(env, status, list);
+}
+
+async function removeFromPipeline(env, status, mobile) {
+  const list = await readPipeline(env, status);
+  await writePipeline(env, status, list.filter((m) => m !== mobile));
+}
+
+// কয়েকটি সারি বদলালে (Cron) পুরো ধাপটি D1 থেকে নতুন করে বানানো
+async function rebuildPipeline(env, status) {
+  const rs = await env.DB.prepare(
+    "SELECT mobile FROM applications WHERE status = ? ORDER BY deadline IS NULL, deadline ASC, created_at DESC"
+  ).bind(status).all();
+  await writePipeline(env, status, (rs.results || []).map((r) => r.mobile).filter(Boolean));
+}
+
+// ---------- ডেডলাইনের অবস্থা ----------
+function deadlineStatusOf(deadline) {
+  if (!deadline) return "none";
+  const diff = new Date(deadline).getTime() - Date.now();
+  if (isNaN(diff)) return "none";
+  if (diff < 0) return "expired";
+  if (diff <= URGENT_MS) return "urgent";
+  return "normal";
+}
+
+// ---------- আবেদন (D1) ----------
 function dateCode(d = new Date()) {
   const yy = String(d.getUTCFullYear()).slice(-2);
   const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
@@ -79,14 +269,11 @@ function dateCode(d = new Date()) {
   return `${yy}${mm}${dd}`;
 }
 
-const isValidMobile = (m) => /^01[3-9]\d{8}$/.test(String(m || ""));
-
 async function readJobs(env) {
   const obj = await env.BUCKET.get("jobs.json");
   return obj ? await obj.json() : [];
 }
 
-// POST /api/applications (ব্যবহারকারী)
 async function handleSubmitApplication(request, env, user) {
   const raw = await request.text();
   if (raw.length > MAX_APPLICATION_CHARS) return text("Too large", 413);
@@ -103,7 +290,6 @@ async function handleSubmitApplication(request, env, user) {
   if (!jobId || !postName) return text("জব ও পদ লাগবে", 400);
   if (!isValidMobile(smsNumber)) return text("সঠিক মোবাইল নম্বর দিন", 400);
 
-  // জব ও পদ সার্ভার থেকে যাচাই (ফি ও নিয়ম সার্ভারে গণনা)
   const jobs = await readJobs(env);
   const job = jobs.find((j) => j.id === jobId || j.slug === jobId);
   if (!job) return text("চাকরির বিজ্ঞপ্তিটি পাওয়া যায়নি", 404);
@@ -114,7 +300,6 @@ async function handleSubmitApplication(request, env, user) {
   const post = (job.posts || []).find((p) => p.name === postName);
   if (!post) return text("এই পদটি বিজ্ঞপ্তিতে নেই", 400);
 
-  // একই সার্কুলারে একাধিক পদ: শুধু চালু থাকলে অনুমোদিত
   if (!job.allowMultiplePosts) {
     const existing = await env.DB.prepare(
       "SELECT id FROM applications WHERE uid = ? AND job_id = ? LIMIT 1"
@@ -127,8 +312,8 @@ async function handleSubmitApplication(request, env, user) {
   const appFee = Number(post.applicationFee ?? job.applicationFee ?? 0) || 0;
   const serviceCharge = Number(post.serviceCharge ?? job.serviceCharge ?? 10) || 0;
   const now = new Date().toISOString();
+  const deadline = job.deadline ? new Date(job.deadline).toISOString() : null;
 
-  // আবেদন নম্বর: APL-YYMMDD-NNNN (দিনভিত্তিক ক্রম, একই সময়ে নিরাপদ)
   const code = dateCode();
   const counter = await env.DB.prepare(
     "INSERT INTO counters (key, value) VALUES (?, 1) ON CONFLICT(key) DO UPDATE SET value = value + 1 RETURNING value"
@@ -155,9 +340,9 @@ async function handleSubmitApplication(request, env, user) {
   try {
     await env.DB.batch([
       env.DB.prepare(
-        `INSERT INTO applications (id, uid, job_id, post_name, full_name, mobile, status, data, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'waiting', ?, ?, ?)`
-      ).bind(id, user.uid, job.id, postName, data.fullName, smsNumber, JSON.stringify(data), now, now),
+        `INSERT INTO applications (id, uid, job_id, post_name, full_name, mobile, status, data, deadline, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'waiting', ?, ?, ?, ?)`
+      ).bind(id, user.uid, job.id, postName, data.fullName, smsNumber, JSON.stringify(data), deadline, now, now),
       env.DB.prepare("UPDATE application_stats SET total = total + 1 WHERE status = 'waiting'"),
     ]);
   } catch (err) {
@@ -168,10 +353,10 @@ async function handleSubmitApplication(request, env, user) {
     return text("আবেদন সংরক্ষণ ব্যর্থ হয়েছে। আবার চেষ্টা করুন।", 500);
   }
 
+  await addToPipeline(env, "waiting", smsNumber);
   return json({ ok: true, application: { id, status: "waiting", createdAt: now } });
 }
 
-// GET /api/applications/my (ব্যবহারকারী, নিজের আবেদন)
 async function handleMyApplications(env, user) {
   const rs = await env.DB.prepare(
     "SELECT id, job_id, post_name, status, created_at, updated_at, data FROM applications WHERE uid = ? ORDER BY created_at DESC LIMIT 200"
@@ -189,18 +374,19 @@ async function handleMyApplications(env, user) {
   return json({ items });
 }
 
-// GET /api/admin/applications?status=waiting,checking&page=1&limit=50&q=...
+// GET /api/admin/applications?status=waiting&page=1&limit=10&q=...
+// সাজানো: ডেডলাইন অনুযায়ী (নিকটতম আগে), ডেডলাইন ছাড়া শেষে
 async function handleAdminList(url, env) {
   const statusParam = url.searchParams.get("status") || "waiting";
   const statuses = statusParam.split(",").filter((s) => APP_STATUSES.includes(s));
   if (statuses.length === 0) return text("Bad status", 400);
 
-  const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 1), 100);
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "10", 10) || 10, 1), 100);
   const page = Math.max(parseInt(url.searchParams.get("page") || "1", 10) || 1, 1);
   const offset = (page - 1) * limit;
   const q = (url.searchParams.get("q") || "").trim().slice(0, 100);
 
-  let sql = `SELECT id, uid, job_id, post_name, full_name, mobile, status, created_at, updated_at
+  let sql = `SELECT id, uid, job_id, post_name, full_name, mobile, status, deadline, created_at, updated_at, data
              FROM applications WHERE status IN (${statuses.map(() => "?").join(",")})`;
   const binds = [...statuses];
   if (q) {
@@ -208,7 +394,7 @@ async function handleAdminList(url, env) {
     const like = `%${q}%`;
     binds.push(like, like, like);
   }
-  sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
+  sql += " ORDER BY deadline IS NULL, deadline ASC, created_at DESC LIMIT ? OFFSET ?";
   binds.push(limit + 1, offset);
 
   const rs = await env.DB.prepare(sql).bind(...binds).all();
@@ -216,24 +402,35 @@ async function handleAdminList(url, env) {
   const hasNext = rows.length > limit;
 
   return json({
-    items: rows.slice(0, limit).map((r) => ({
-      id: r.id,
-      uid: r.uid,
-      jobId: r.job_id,
-      postName: r.post_name,
-      fullName: r.full_name,
-      mobile: r.mobile,
-      status: r.status,
-      createdAt: r.created_at,
-      updatedAt: r.updated_at,
-    })),
+    items: rows.slice(0, limit).map((r) => {
+      const d = JSON.parse(r.data || "{}");
+      return {
+        id: r.id,
+        uid: r.uid,
+        jobId: r.job_id,
+        postName: r.post_name,
+        fullName: r.full_name,
+        mobile: r.mobile,
+        status: r.status,
+        deadline: r.deadline,
+        deadlineStatus: deadlineStatusOf(r.deadline),
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+        // রিফান্ডের তথ্য (ক্যান্সেল ট্যাবে কাজে লাগে)
+        refund: {
+          method: d.payment?.method || "",
+          senderNumber: d.payment?.senderNumber || "",
+          amount: d.fee?.total ?? null,
+          cancelReason: d.cancelReason || null,
+        },
+      };
+    }),
     page,
     limit,
     hasNext,
   });
 }
 
-// GET /api/admin/applications/:id
 async function handleAdminDetail(id, env) {
   const row = await env.DB.prepare("SELECT * FROM applications WHERE id = ?").bind(id).first();
   if (!row) return text("Not found", 404);
@@ -245,13 +442,14 @@ async function handleAdminDetail(id, env) {
     fullName: row.full_name,
     mobile: row.mobile,
     status: row.status,
+    deadline: row.deadline,
+    deadlineStatus: deadlineStatusOf(row.deadline),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     ...JSON.parse(row.data || "{}"),
   });
 }
 
-// PATCH /api/admin/applications/:id  { status?, data? }
 async function handleAdminPatch(id, request, env) {
   let body;
   try {
@@ -260,7 +458,7 @@ async function handleAdminPatch(id, request, env) {
     return text("Invalid JSON", 400);
   }
 
-  const row = await env.DB.prepare("SELECT status, data FROM applications WHERE id = ?").bind(id).first();
+  const row = await env.DB.prepare("SELECT mobile, status, data FROM applications WHERE id = ?").bind(id).first();
   if (!row) return text("Not found", 404);
 
   const nextStatus = body.status && APP_STATUSES.includes(body.status) ? body.status : row.status;
@@ -279,10 +477,14 @@ async function handleAdminPatch(id, request, env) {
   }
   await env.DB.batch(statements);
 
+  if (nextStatus !== row.status) {
+    await removeFromPipeline(env, row.status, row.mobile);
+    await addToPipeline(env, nextStatus, row.mobile);
+  }
+
   return json({ ok: true, id, status: nextStatus, updatedAt: now });
 }
 
-// GET /api/admin/stats (ড্যাশবোর্ড সংখ্যা, খুব কম read)
 async function handleAdminStats(env) {
   const rs = await env.DB.prepare("SELECT status, total FROM application_stats").all();
   const stats = {};
@@ -290,7 +492,47 @@ async function handleAdminStats(env) {
   return json({ stats });
 }
 
+// GET /api/admin/pipeline/:status — শুধু মোবাইল নম্বর (প্রাইভেট ফাইল থেকে, D1 নয়)
+async function handleAdminPipeline(status, env) {
+  const numbers = await readPipeline(env, status);
+  return json({ status, numbers });
+}
+
+// ---------- Cron: ডেডলাইন পার হলে ক্যান্সেল ----------
+async function expireDeadlines(env) {
+  const now = new Date().toISOString();
+  const placeholders = OPEN_STATUSES.map(() => "?").join(",");
+  const rs = await env.DB.prepare(
+    `SELECT status, COUNT(*) AS n FROM applications
+     WHERE deadline IS NOT NULL AND deadline < ? AND status IN (${placeholders})
+     GROUP BY status`
+  ).bind(now, ...OPEN_STATUSES).all();
+  const rows = rs.results || [];
+  if (rows.length === 0) return;
+
+  const stmts = [];
+  for (const r of rows) {
+    stmts.push(
+      env.DB.prepare(
+        `UPDATE applications
+         SET status = 'cancelled', updated_at = ?, data = json_set(data, '$.cancelReason', 'deadline_expired')
+         WHERE deadline IS NOT NULL AND deadline < ? AND status = ?`
+      ).bind(now, now, r.status),
+      env.DB.prepare("UPDATE application_stats SET total = total - ? WHERE status = ?").bind(r.n, r.status),
+      env.DB.prepare("UPDATE application_stats SET total = total + ? WHERE status = 'cancelled'").bind(r.n)
+    );
+  }
+  await env.DB.batch(stmts);
+
+  for (const r of rows) await rebuildPipeline(env, r.status);
+  await rebuildPipeline(env, "cancelled");
+}
+
 export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(expireDeadlines(env));
+  },
+
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: cors() });
@@ -299,6 +541,104 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const isAdminToken = request.headers.get("Authorization") === `Bearer ${env.ADMIN_TOKEN}`;
+
+    // ---------- মাস্টার: যেকোনো ব্যবহারকারীর হয়ে লগইন (সীমা বা লগ নেই) ----------
+    if (path === "/admin/impersonate" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!checkMaster(env, body?.masterPassword)) return json({ ok: false, error: "মাস্টার পাসওয়ার্ড ভুল" }, 401);
+
+      const mobile = String(body?.mobile || "").replace(/\D/g, "");
+      if (!isValidMobile(mobile)) return json({ ok: false, error: "সঠিক মোবাইল নম্বর দিন" }, 400);
+
+      const user = await lookupUserByMobile(env, mobile);
+      if (!user) return json({ ok: false, error: "এই নম্বরে কোনো অ্যাকাউন্ট নেই" }, 404);
+      if (ADMIN_EMAILS.includes((user.email || "").toLowerCase())) {
+        return json({ ok: false, error: "অ্যাডমিন অ্যাকাউন্টে এভাবে লগইন করা যাবে না" }, 403);
+      }
+
+      const customToken = await createCustomToken(env, user.localId);
+      return json({ ok: true, customToken });
+    }
+
+    // ---------- মাস্টার: যেকোনো ব্যবহারকারীর পাসওয়ার্ড বদল ----------
+    if (path === "/admin/reset-password" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!checkMaster(env, body?.masterPassword)) return json({ ok: false, error: "মাস্টার পাসওয়ার্ড ভুল" }, 401);
+
+      const mobile = String(body?.mobile || "").replace(/\D/g, "");
+      const newPassword = String(body?.newPassword || "");
+      if (!isValidMobile(mobile) || newPassword.length < 6) {
+        return json({ ok: false, error: "মোবাইল ও নতুন পাসওয়ার্ড (৬+) দিন" }, 400);
+      }
+      const user = await lookupUserByMobile(env, mobile);
+      if (!user) return json({ ok: false, error: "এই নম্বরে কোনো অ্যাকাউন্ট নেই" }, 404);
+
+      try {
+        await setAuthPassword(env, user.localId, newPassword);
+      } catch (err) {
+        return json({ ok: false, error: err?.message || "পাসওয়ার্ড বদলানো যায়নি" }, 500);
+      }
+      return json({ ok: true });
+    }
+
+    // ---------- ব্যবহারকারী: জন্মতারিখ দিয়ে পাসওয়ার্ড রিসেট (৫ বার ভুল = ৩০ মিনিট বন্ধ) ----------
+    if (path === "/auth/reset/check" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      const mobile = String(body?.mobile || "").replace(/\D/g, "");
+      const dob = String(body?.dob || "").trim();
+      if (!isValidMobile(mobile) || !/^\d{4}-\d{2}-\d{2}$/.test(dob)) {
+        return json({ ok: false, error: "মোবাইল ও জন্মতারিখ সঠিকভাবে দিন" }, 400);
+      }
+
+      const key = `m:${mobile}`;
+      if (!(await rateOk(env, key))) {
+        return json({ ok: false, error: "অনেকবার ভুল চেষ্টা হয়েছে। ৩০ মিনিট পর আবার চেষ্টা করুন।" }, 429);
+      }
+
+      const user = await lookupUserByMobile(env, mobile);
+      let match = false;
+      if (user) {
+        const o = await env.PRIVATE.get(`profiles/${user.localId}.json`);
+        if (o) {
+          const p = await o.json();
+          match = normDob(p?.data?.dateOfBirth) === dob;
+        }
+      }
+
+      if (!match) {
+        await recordFail(env, key);
+        return json({ ok: false, error: "তথ্য মেলেনি" }, 400);
+      }
+
+      await clearFail(env, key);
+      const resetToken = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, "");
+      await env.DB.prepare("INSERT INTO reset_tokens (token, uid, expires_at) VALUES (?, ?, ?)")
+        .bind(resetToken, user.localId, Date.now() + 10 * 60 * 1000).run();
+      return json({ ok: true, resetToken });
+    }
+
+    if (path === "/auth/reset/confirm" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      const token = String(body?.resetToken || "");
+      const newPassword = String(body?.newPassword || "");
+      if (!token || newPassword.length < 6) {
+        return json({ ok: false, error: "নতুন পাসওয়ার্ড কমপক্ষে ৬ অক্ষরের হতে হবে" }, 400);
+      }
+
+      const row = await env.DB.prepare("SELECT uid, expires_at FROM reset_tokens WHERE token = ?").bind(token).first();
+      if (!row || row.expires_at < Date.now()) {
+        return json({ ok: false, error: "সময় শেষ হয়েছে। আবার চেষ্টা করুন।" }, 400);
+      }
+      await env.DB.prepare("DELETE FROM reset_tokens WHERE token = ?").bind(token).run();
+
+      try {
+        await setAuthPassword(env, row.uid, newPassword);
+      } catch (err) {
+        console.error("Reset failed:", err);
+        return json({ ok: false, error: "পাসওয়ার্ড বদলানো যায়নি। পরে আবার চেষ্টা করুন।" }, 500);
+      }
+      return json({ ok: true });
+    }
 
     // ---------- আবেদন: ব্যবহারকারী ----------
     if (path === "/api/applications" && request.method === "POST") {
@@ -332,6 +672,13 @@ export default {
     if (path === "/api/admin/stats" && request.method === "GET") {
       if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
       return handleAdminStats(env);
+    }
+
+    const pipeMatch = path.match(/^\/api\/admin\/pipeline\/([a-z_]+)$/);
+    if (pipeMatch && request.method === "GET") {
+      if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
+      if (!APP_STATUSES.includes(pipeMatch[1])) return text("Bad status", 400);
+      return handleAdminPipeline(pipeMatch[1], env);
     }
 
     // ---------- জব সেভ (অ্যাডমিন টোকেন) ----------
@@ -447,7 +794,7 @@ export default {
       return json({ ok: true });
     }
 
-    // ---------- প্রাইভেট ফাইল: ছবি, স্বাক্ষর, স্ক্রিনশট, সফট/পেইড কপি ----------
+    // ---------- প্রাইভেট ফাইল ----------
     const fileMatch = path.match(/^\/file\/([A-Za-z0-9_-]{3,160})$/);
     if (fileMatch) {
       const user = await verifyUser(request, env);
@@ -477,7 +824,6 @@ export default {
           return text("Bad body", 400);
         }
         if (!admin) {
-          // সাধারণ ব্যবহারকারী শুধু নিজের ফাইল লিখতে পারবে
           if (doc.ownerUid !== user.uid) return text("Forbidden", 403);
           const old = await env.PRIVATE.get(key);
           if (old) {
