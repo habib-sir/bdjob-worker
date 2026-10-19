@@ -419,6 +419,7 @@ async function handleAdminList(url, env) {
         deadlineStatus: deadlineStatusOf(r.deadline),
         createdAt: r.created_at,
         updatedAt: r.updated_at,
+        applyLink: d.applyLink || "",
         // রিফান্ডের তথ্য (ক্যান্সেল ট্যাবে কাজে লাগে)
         refund: {
           method: d.payment?.method || "",
