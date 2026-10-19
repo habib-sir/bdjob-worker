@@ -542,22 +542,57 @@ export default {
     const path = url.pathname;
     const isAdminToken = request.headers.get("Authorization") === `Bearer ${env.ADMIN_TOKEN}`;
 
-    // ---------- মাস্টার: যেকোনো ব্যবহারকারীর হয়ে লগইন (সীমা বা লগ নেই) ----------
+        // ---------- মাস্টার: যেকোনো ব্যবহারকারীর হয়ে লগইন (ধাপ-ভিত্তিক ডায়াগনসিস) ----------
     if (path === "/admin/impersonate" && request.method === "POST") {
-      const body = await request.json().catch(() => null);
-      if (!checkMaster(env, body?.masterPassword)) return json({ ok: false, error: "মাস্টার পাসওয়ার্ড ভুল" }, 401);
+      let step = "body";
+      try {
+        const body = await request.json().catch(() => null);
 
-      const mobile = String(body?.mobile || "").replace(/\D/g, "");
-      if (!isValidMobile(mobile)) return json({ ok: false, error: "সঠিক মোবাইল নম্বর দিন" }, 400);
+        step = "master";
+        if (!checkMaster(env, body?.masterPassword)) {
+          return json({ ok: false, step, error: "মাস্টার পাসওয়ার্ড ভুল" }, 401);
+        }
 
-      const user = await lookupUserByMobile(env, mobile);
-      if (!user) return json({ ok: false, error: "এই নম্বরে কোনো অ্যাকাউন্ট নেই" }, 404);
-      if (ADMIN_EMAILS.includes((user.email || "").toLowerCase())) {
-        return json({ ok: false, error: "অ্যাডমিন অ্যাকাউন্টে এভাবে লগইন করা যাবে না" }, 403);
+        const mobile = String(body?.mobile || "").replace(/\D/g, "");
+        if (!isValidMobile(mobile)) return json({ ok: false, step, error: "সঠিক মোবাইল নম্বর দিন" }, 400);
+
+        step = "secrets";
+        const info = {
+          hasSaEmail: !!env.FIREBASE_SA_EMAIL,
+          hasSaKey: !!env.FIREBASE_SA_PRIVATE_KEY,
+          keyLength: (env.FIREBASE_SA_PRIVATE_KEY || "").length,
+          hasDomain: !!env.USER_EMAIL_DOMAIN,
+        };
+
+        step = "pem";
+        pemToDer(env.FIREBASE_SA_PRIVATE_KEY);
+
+        step = "import-key";
+        const dummy = pemToDer(env.FIREBASE_SA_PRIVATE_KEY);
+        await crypto.subtle.importKey(
+          "pkcs8",
+          dummy,
+          { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+          false,
+          ["sign"]
+        );
+
+        step = "google-token";
+        await getGoogleAccessToken(env);
+
+        step = "lookup";
+        const user = await lookupUserByMobile(env, mobile);
+        if (!user) return json({ ok: false, step, info, error: "এই নম্বরে কোনো অ্যাকাউন্ট নেই" }, 404);
+        if (ADMIN_EMAILS.includes((user.email || "").toLowerCase())) {
+          return json({ ok: false, step, error: "অ্যাডমিন অ্যাকাউন্টে এভাবে লগইন করা যাবে না" }, 403);
+        }
+
+        step = "sign";
+        const customToken = await createCustomToken(env, user.localId);
+        return json({ ok: true, customToken });
+      } catch (err) {
+        return json({ ok: false, step, error: String(err?.message || err).slice(0, 200) }, 500);
       }
-
-      const customToken = await createCustomToken(env, user.localId);
-      return json({ ok: true, customToken });
     }
 
     // ---------- মাস্টার: যেকোনো ব্যবহারকারীর পাসওয়ার্ড বদল ----------
