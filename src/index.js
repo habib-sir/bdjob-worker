@@ -92,8 +92,11 @@ function strB64url(s) {
 }
 
 function pemToDer(pem) {
-  const b64 = pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
-  const bin = atob(b64);
+  let s = String(pem || "");
+  s = s.replace(/\\n/g, "\n").replace(/\r/g, "");
+  s = s.replace(/-----BEGIN [^-]+-----/g, "").replace(/-----END [^-]+-----/g, "");
+  s = s.replace(/[^A-Za-z0-9+/=]/g, "");
+  const bin = atob(s);
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out.buffer;
