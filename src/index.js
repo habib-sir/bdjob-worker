@@ -377,6 +377,49 @@ async function handleMyApplications(env, user) {
   return json({ items });
 }
 
+// PATCH /api/applications/:id/review (ব্যবহারকারী: সফট কপি সঠিক বা সংশোধন)
+// শুধু "checking" ধাপের নিজের আবেদনে কাজ করবে। approve → payment_now, correction → correction
+async function handleUserReview(id, request, env, user) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return text("Invalid JSON", 400);
+  }
+
+  const row = await env.DB.prepare("SELECT uid, mobile, status, data FROM applications WHERE id = ?").bind(id).first();
+  if (!row) return text("Not found", 404);
+  if (row.uid !== user.uid) return text("Forbidden", 403);
+  if (row.status !== "checking") return text("এই আবেদনটি এখন যাচাইয়ের ধাপে নেই", 409);
+
+  const now = new Date().toISOString();
+  const data = JSON.parse(row.data || "{}");
+  let nextStatus;
+
+  if (body.action === "approve") {
+    nextStatus = "payment_now";
+  } else if (body.action === "correction") {
+    const note = String(body.note || "").trim().slice(0, 1000);
+    if (!note) return text("সংশোধনের বিবরণ লিখুন", 400);
+    nextStatus = "correction";
+    data.correctionNote = note;
+  } else {
+    return text("Bad action", 400);
+  }
+
+  await env.DB.batch([
+    env.DB.prepare("UPDATE applications SET status = ?, data = ?, updated_at = ? WHERE id = ?")
+      .bind(nextStatus, JSON.stringify(data), now, id),
+    env.DB.prepare("UPDATE application_stats SET total = total - 1 WHERE status = 'checking'"),
+    env.DB.prepare("UPDATE application_stats SET total = total + 1 WHERE status = ?").bind(nextStatus),
+  ]);
+
+  await removeFromPipeline(env, "checking", row.mobile);
+  await addToPipeline(env, nextStatus, row.mobile);
+
+  return json({ ok: true, id, status: nextStatus, updatedAt: now });
+}
+
 // GET /api/admin/applications?status=waiting&page=1&limit=10&q=...
 // সাজানো: ডেডলাইন অনুযায়ী (নিকটতম আগে), ডেডলাইন ছাড়া শেষে
 async function handleAdminList(url, env) {
@@ -546,7 +589,7 @@ export default {
     const path = url.pathname;
     const isAdminToken = request.headers.get("Authorization") === `Bearer ${env.ADMIN_TOKEN}`;
 
-        // ---------- মাস্টার: যেকোনো ব্যবহারকারীর হয়ে লগইন (ধাপ-ভিত্তিক ডায়াগনসিস) ----------
+    // ---------- মাস্টার: যেকোনো ব্যবহারকারীর হয়ে লগইন (ধাপ-ভিত্তিক ডায়াগনসিস) ----------
     if (path === "/admin/impersonate" && request.method === "POST") {
       let step = "body";
       try {
@@ -690,6 +733,14 @@ export default {
       const user = await verifyUser(request, env);
       if (!user) return text("Unauthorized", 401);
       return handleMyApplications(env, user);
+    }
+
+    // ---------- আবেদন: ব্যবহারকারীর সফট কপি যাচাই (সঠিক / সংশোধন) ----------
+    const reviewMatch = path.match(/^\/api\/applications\/([A-Za-z0-9-]{4,60})\/review$/);
+    if (reviewMatch && request.method === "PATCH") {
+      const user = await verifyUser(request, env);
+      if (!user) return text("Unauthorized", 401);
+      return handleUserReview(reviewMatch[1], request, env, user);
     }
 
     // ---------- আবেদন: অ্যাডমিন ----------
