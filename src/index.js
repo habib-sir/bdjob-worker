@@ -268,7 +268,64 @@ function deadlineStatusOf(deadline) {
   if (diff <= URGENT_MS) return "urgent";
   return "normal";
 }
+// ---------- আর্কাইব: একটি সার্কুলার খোঁজা, মোছা ও সম্পাদনা ----------
+async function findArchivedJob(env, id) {
+  const index = await readR2Json(env, ARCHIVE_INDEX_FILE, []);
+  const entry = index.find((e) => e.id === id);
+  if (!entry) return { entry: null, job: null };
+  const list = await readR2Json(env, archiveFileOf(entry.month), []);
+  const job = list.find((j) => j.id === id) || null;
+  return { entry, job };
+}
 
+async function removeArchivedJob(env, id, month) {
+  const key = archiveFileOf(month);
+  const list = await readR2Json(env, key, []);
+  await writeR2Json(env, key, list.filter((j) => j.id !== id), "public, max-age=3600");
+
+  const index = await readR2Json(env, ARCHIVE_INDEX_FILE, []);
+  await writeR2Json(env, ARCHIVE_INDEX_FILE, index.filter((e) => e.id !== id), "public, max-age=3600");
+}
+
+// GET / PUT / PATCH / DELETE /api/admin/archive/:id
+async function handleArchiveAdmin(id, request, env, method) {
+  const { entry, job } = await findArchivedJob(env, id);
+  if (!entry || !job) return text("Not found", 404);
+
+  if (method === "GET") return json(job);
+
+  if (method === "DELETE") {
+    await removeArchivedJob(env, id, entry.month);
+    return json({ ok: true, deleted: id });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return text("Invalid JSON", 400);
+  }
+
+  const next = { ...job, ...body, id };
+  delete next.archived;
+
+  // শেষ তারিখ বদলে আবার চলমান হলে চলমান তালিকায় ফিরবে
+  if (isLiveJob(next, Date.now())) {
+    await removeArchivedJob(env, id, entry.month);
+    const active = await readR2Json(env, ACTIVE_JOBS_FILE, []);
+    await writeActiveJobs(env, [next, ...active.filter((j) => j.id !== id)]);
+    return json({ ok: true, moved: "active" });
+  }
+
+  // শেষ তারিখের মাস বদলালে পুরনো মাস থেকে সরিয়ে নতুন মাসে যাবে
+  const newMonth = archiveMonthOf(next);
+  const monthChanged = newMonth !== entry.month;
+  if (monthChanged) {
+    await removeArchivedJob(env, id, entry.month);
+  }
+  await archiveJobs(env, [next]);
+  return json({ ok: true, moved: monthChanged ? "archive-month" : "archive", month: newMonth });
+}
 // ---------- R2 JSON সহায়ক ----------
 async function readR2Json(env, key, fallback) {
   const obj = await env.BUCKET.get(key);
@@ -860,6 +917,13 @@ export default {
       const user = await verifyUser(request, env);
       if (!user) return text("Unauthorized", 401);
       return handleUserReview(reviewMatch[1], request, env, user);
+    }
+
+        // ---------- আর্কাইব: সার্কুলার দেখা, সম্পাদনা, মোছা (অ্যাডমিন) ----------
+    const archiveAdminMatch = path.match(/^\/api\/admin\/archive\/([A-Za-z0-9_-]{3,120})$/);
+    if (archiveAdminMatch && ["GET", "PUT", "PATCH", "DELETE"].includes(request.method)) {
+      if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
+      return handleArchiveAdmin(archiveAdminMatch[1], request, env, request.method);
     }
 
     // ---------- আবেদন: অ্যাডমিন ----------
