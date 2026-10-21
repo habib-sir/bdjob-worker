@@ -934,6 +934,12 @@ export default {
       return handleArchiveAdmin(archiveAdminMatch[1], request, env, request.method);
     }
 
+        // ---------- চাকরির প্রস্তুতি: অ্যাডমিন সংরক্ষণ ----------
+    if (path === "/api/admin/prep" && request.method === "PUT") {
+      if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
+      return handleAdminPrepSave(request, env);
+    }
+
     // ---------- আবেদন: অ্যাডমিন ----------
     if (path === "/api/admin/applications" && request.method === "GET") {
       if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
@@ -979,6 +985,47 @@ export default {
       const result = await saveJobsWithArchive(env, jobs);
       return json({ ok: true, count: jobs.length, ...result });
     }
+
+    // ---------- চাকরির প্রস্তুতি: লিখিত প্রশ্ন-উত্তর (অ্যাডমিন সংরক্ষণ) ----------
+const PREP_FILE = "prep-data.json";
+const MAX_PREP_BYTES = 3000000;
+
+function sanitizePrepTopic(t) {
+  const items = Array.isArray(t?.items) ? t.items : [];
+  return {
+    id: String(t?.id || "").slice(0, 80),
+    name: String(t?.name || "").slice(0, 200),
+    items: items.map((i) => ({
+      id: String(i?.id || "").slice(0, 80),
+      question: String(i?.question || "").slice(0, 5000),
+      answer: String(i?.answer || "").slice(0, 20000),
+      note: String(i?.note || "").slice(0, 5000),
+      tags: Array.isArray(i?.tags) ? i.tags.slice(0, 20).map((x) => String(x).slice(0, 50)) : [],
+    })),
+  };
+}
+
+async function handleAdminPrepSave(request, env) {
+  const raw = await request.text();
+  if (raw.length > MAX_PREP_BYTES) return text("Too large", 413);
+  let doc;
+  try {
+    doc = JSON.parse(raw);
+  } catch {
+    return text("Invalid JSON", 400);
+  }
+  if (!doc || !Array.isArray(doc.topics)) return text("Bad body", 400);
+
+  const current = await readR2Json(env, PREP_FILE, { version: 0 });
+  const next = {
+    version: (Number(current.version) || 0) + 1,
+    updatedAt: new Date().toISOString(),
+    topics: doc.topics.map(sanitizePrepTopic),
+  };
+  // সংস্করণ বাড়লে ডিভাইস নতুন ডেটা নেবে; ক্যাশ ছোট রাখা হয়েছে
+  await writeR2Json(env, PREP_FILE, next, "public, max-age=60");
+  return json({ ok: true, version: next.version });
+}
 
     // ---------- পাবলিক JSON লেখা (অ্যাডমিন টোকেন) ----------
     const publicMatch = path.match(/^\/admin\/public\/([a-z-]+)$/);
