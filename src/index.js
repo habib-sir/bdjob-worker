@@ -9,15 +9,20 @@ const MAX_PUBLIC_JSON_BYTES = 100000;
 const MAX_UPLOAD_BYTES = 500000;
 const MAX_FILE_CHARS = 1400000;
 const MAX_APPLICATION_CHARS = 60000;
+const MAX_PREP_BYTES = 3000000;
 const RESET_MAX_FAILS = 5;
 const RESET_BLOCK_MS = 30 * 60 * 1000;
 const URGENT_MS = 2 * 24 * 60 * 60 * 1000;
 
 // ---------- সার্কুলার আর্কাইব ----------
-const ARCHIVE_GRACE_MS = 2 * 24 * 60 * 60 * 1000; // শেষ তারিখের ২ দিন পর আর্কাইব
+const ARCHIVE_GRACE_MS = 2 * 24 * 60 * 60 * 1000;
 const ACTIVE_JOBS_FILE = "jobs.json";
 const FEED_LIMIT = 15;
 const ARCHIVE_INDEX_FILE = "jobs/archive/index.json";
+
+// ---------- চাকরির প্রস্তুতি ----------
+const PREP_FILE = "prep-data.json";
+const PREP_META_FILE = "prep-meta.json";
 
 const APP_STATUSES = ["waiting", "apply_now", "checking", "correction", "payment_now", "applied", "rejected", "cancelled"];
 const OPEN_STATUSES = ["waiting", "apply_now", "checking", "correction", "payment_now"];
@@ -187,7 +192,7 @@ async function setAuthPassword(env, uid, password) {
   if (!res.ok) throw new Error(`পাসওয়ার্ড বদলানো যায়নি (HTTP ${res.status})`);
 }
 
-// ---------- মাস্টার পাসওয়ার্ড (লগ বা সীমা নেই) ----------
+// ---------- মাস্টার পাসওয়ার্ড ----------
 function safeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
   let diff = 0;
@@ -225,7 +230,7 @@ function normDob(v) {
   return m ? `${m[1]}-${m[2]}-${m[3]}` : s;
 }
 
-// ---------- ধাপের মোবাইল-তালিকা (প্রাইভেট bucket, অ্যাডমিন দেখে) ----------
+// ---------- ধাপের মোবাইল-তালিকা ----------
 const pipelineKey = (status) => `pipeline/${status}.txt`;
 
 async function readPipeline(env, status) {
@@ -268,64 +273,7 @@ function deadlineStatusOf(deadline) {
   if (diff <= URGENT_MS) return "urgent";
   return "normal";
 }
-// ---------- আর্কাইব: একটি সার্কুলার খোঁজা, মোছা ও সম্পাদনা ----------
-async function findArchivedJob(env, id) {
-  const index = await readR2Json(env, ARCHIVE_INDEX_FILE, []);
-  const entry = index.find((e) => e.id === id);
-  if (!entry) return { entry: null, job: null };
-  const list = await readR2Json(env, archiveFileOf(entry.month), []);
-  const job = list.find((j) => j.id === id) || null;
-  return { entry, job };
-}
 
-async function removeArchivedJob(env, id, month) {
-  const key = archiveFileOf(month);
-  const list = await readR2Json(env, key, []);
-  await writeR2Json(env, key, list.filter((j) => j.id !== id), "public, max-age=3600");
-
-  const index = await readR2Json(env, ARCHIVE_INDEX_FILE, []);
-  await writeR2Json(env, ARCHIVE_INDEX_FILE, index.filter((e) => e.id !== id), "public, max-age=3600");
-}
-
-// GET / PUT / PATCH / DELETE /api/admin/archive/:id
-async function handleArchiveAdmin(id, request, env, method) {
-  const { entry, job } = await findArchivedJob(env, id);
-  if (!entry || !job) return text("Not found", 404);
-
-  if (method === "GET") return json(job);
-
-  if (method === "DELETE") {
-    await removeArchivedJob(env, id, entry.month);
-    return json({ ok: true, deleted: id });
-  }
-
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return text("Invalid JSON", 400);
-  }
-
-  const next = { ...job, ...body, id };
-  delete next.archived;
-
-  // শেষ তারিখ বদলে আবার চলমান হলে চলমান তালিকায় ফিরবে
-  if (isLiveJob(next, Date.now())) {
-    await removeArchivedJob(env, id, entry.month);
-    const active = await readR2Json(env, ACTIVE_JOBS_FILE, []);
-    await writeActiveJobs(env, [next, ...active.filter((j) => j.id !== id)]);
-    return json({ ok: true, moved: "active" });
-  }
-
-  // শেষ তারিখের মাস বদলালে পুরনো মাস থেকে সরিয়ে নতুন মাসে যাবে
-  const newMonth = archiveMonthOf(next);
-  const monthChanged = newMonth !== entry.month;
-  if (monthChanged) {
-    await removeArchivedJob(env, id, entry.month);
-  }
-  await archiveJobs(env, [next]);
-  return json({ ok: true, moved: monthChanged ? "archive-month" : "archive", month: newMonth });
-}
 // ---------- R2 JSON সহায়ক ----------
 async function readR2Json(env, key, fallback) {
   const obj = await env.BUCKET.get(key);
@@ -350,7 +298,6 @@ const jobEndTime = (j) => {
   return isNaN(t) ? null : t;
 };
 
-// ড্রাফট সবসময় চলমানে; শেষ তারিখ না থাকলে চলমানে; শেষ তারিখের ২ দিন পর আর্কাইব
 const isLiveJob = (j, now) => {
   if (j.status === "draft") return true;
   const t = jobEndTime(j);
@@ -358,7 +305,6 @@ const isLiveJob = (j, now) => {
   return t + ARCHIVE_GRACE_MS >= now;
 };
 
-// আর্কাইব মাস = শেষ তারিখের মাস (UTC)
 const archiveMonthOf = (j) => {
   const t = jobEndTime(j);
   if (t === null) return null;
@@ -368,7 +314,6 @@ const archiveMonthOf = (j) => {
 
 const archiveFileOf = (month) => `jobs/archive/${month}.json`;
 
-// চলমান সার্কুলার ও ফিড লেখা (সাইট এই ফাইল পড়ে)
 async function writeActiveJobs(env, activeJobs) {
   await writeR2Json(env, ACTIVE_JOBS_FILE, activeJobs, "public, max-age=60");
 
@@ -389,7 +334,6 @@ async function writeActiveJobs(env, activeJobs) {
   await writeR2Json(env, "feed.json", { posts: feedPosts, updatedAt: new Date().toISOString() }, "public, max-age=60");
 }
 
-// মেয়াদ শেষ সার্কুলার মাস অনুযায়ী আর্কাইবে যোগ (একই আইডি থাকলে বদলে দেয়)
 async function archiveJobs(env, jobs) {
   if (!jobs.length) return;
 
@@ -409,7 +353,6 @@ async function archiveJobs(env, jobs) {
     await writeR2Json(env, key, [...map.values()], "public, max-age=3600");
   }
 
-  // সূচক: শুধু স্লাগ, আইডি, শিরোনাম, মাস
   const index = await readR2Json(env, ARCHIVE_INDEX_FILE, []);
   const idx = new Map(index.map((e) => [e.id, e]));
   for (const j of jobs) {
@@ -420,13 +363,21 @@ async function archiveJobs(env, jobs) {
   await writeR2Json(env, ARCHIVE_INDEX_FILE, [...idx.values()], "public, max-age=3600");
 }
 
-// অ্যাডমিন যে সম্পূর্ণ তালিকা পাঠায়: চলমান অংশ জব ফাইলে, মেয়াদ শেষ অংশ আর্কাইবে
+async function removeArchivedJob(env, id, month) {
+  const key = archiveFileOf(month);
+  const list = await readR2Json(env, key, []);
+  await writeR2Json(env, key, list.filter((j) => j.id !== id), "public, max-age=3600");
+
+  const index = await readR2Json(env, ARCHIVE_INDEX_FILE, []);
+  await writeR2Json(env, ARCHIVE_INDEX_FILE, index.filter((e) => e.id !== id), "public, max-age=3600");
+}
+
 async function saveJobsWithArchive(env, posted) {
   const now = Date.now();
   const live = posted.filter((j) => isLiveJob(j, now));
   const expired = posted.filter((j) => !isLiveJob(j, now));
 
-  // আর্কাইবে থাকা সার্কুলার আবার চলমান হলে আর্কাইব থেকে সরবে (দুই জায়গায় থাকবে না)
+  // আর্কাইবে থাকা সার্কুলার আবার চলমান হলে আর্কাইব থেকে সরবে
   const index = await readR2Json(env, ARCHIVE_INDEX_FILE, []);
   for (const j of live) {
     const entry = index.find((e) => e.id === j.id);
@@ -438,7 +389,6 @@ async function saveJobsWithArchive(env, posted) {
   return { live: live.length, archived: expired.length };
 }
 
-// Cron: চলমান তালিকা থেকে মেয়াদ শেষ সার্কুলার আর্কাইবে সরানো
 async function rotateExpiredJobs(env) {
   const active = await readR2Json(env, ACTIVE_JOBS_FILE, []);
   const now = Date.now();
@@ -449,6 +399,53 @@ async function rotateExpiredJobs(env) {
   await writeActiveJobs(env, keep);
 }
 
+async function findArchivedJob(env, id) {
+  const index = await readR2Json(env, ARCHIVE_INDEX_FILE, []);
+  const entry = index.find((e) => e.id === id);
+  if (!entry) return { entry: null, job: null };
+  const list = await readR2Json(env, archiveFileOf(entry.month), []);
+  const job = list.find((j) => j.id === id) || null;
+  return { entry, job };
+}
+
+// GET / PUT / PATCH / DELETE /api/admin/archive/:id
+async function handleArchiveAdmin(id, request, env, method) {
+  const { entry, job } = await findArchivedJob(env, id);
+  if (!entry || !job) return text("Not found", 404);
+
+  if (method === "GET") return json(job);
+
+  if (method === "DELETE") {
+    await removeArchivedJob(env, id, entry.month);
+    return json({ ok: true, deleted: id });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return text("Invalid JSON", 400);
+  }
+
+  const next = { ...job, ...body, id };
+  delete next.archived;
+
+  if (isLiveJob(next, Date.now())) {
+    await removeArchivedJob(env, id, entry.month);
+    const active = await readR2Json(env, ACTIVE_JOBS_FILE, []);
+    await writeActiveJobs(env, [next, ...active.filter((j) => j.id !== id)]);
+    return json({ ok: true, moved: "active" });
+  }
+
+  const newMonth = archiveMonthOf(next);
+  const monthChanged = newMonth !== entry.month;
+  if (monthChanged) {
+    await removeArchivedJob(env, id, entry.month);
+  }
+  await archiveJobs(env, [next]);
+  return json({ ok: true, moved: monthChanged ? "archive-month" : "archive", month: newMonth });
+}
+
 // ---------- আবেদন (D1) ----------
 function dateCode(d = new Date()) {
   const yy = String(d.getUTCFullYear()).slice(-2);
@@ -457,12 +454,9 @@ function dateCode(d = new Date()) {
   return `${yy}${mm}${dd}`;
 }
 
-// আবেদনের জন্য জব খোঁজা: চলমান ফাইল, না পেলে আর্কাইব সূচক থেকে
 async function findJobForApplication(env, jobId) {
   const active = await readR2Json(env, ACTIVE_JOBS_FILE, []);
-  const found = active.find((j) => j.id === jobId || j.slug === jobId);
-  if (found) return found;
-  return null;
+  return active.find((j) => j.id === jobId || j.slug === jobId) || null;
 }
 
 async function handleSubmitApplication(request, env, user) {
@@ -564,7 +558,6 @@ async function handleMyApplications(env, user) {
   return json({ items });
 }
 
-// PATCH /api/applications/:id/review (ব্যবহারকারী: সফট কপি সঠিক বা সংশোধন)
 async function handleUserReview(id, request, env, user) {
   let body;
   try {
@@ -606,7 +599,6 @@ async function handleUserReview(id, request, env, user) {
   return json({ ok: true, id, status: nextStatus, updatedAt: now });
 }
 
-// GET /api/admin/applications?status=waiting&page=1&limit=10&q=...
 async function handleAdminList(url, env) {
   const statusParam = url.searchParams.get("status") || "waiting";
   const statuses = statusParam.split(",").filter((s) => APP_STATUSES.includes(s));
@@ -728,7 +720,56 @@ async function handleAdminPipeline(status, env) {
   return json({ status, numbers });
 }
 
-// ---------- Cron: ডেডলাইন পার হলে আবেদন ক্যান্সেল ----------
+// ---------- চাকরির প্রস্তুতি: অ্যাডমিন সংরক্ষণ ----------
+function sanitizePrepTopic(t) {
+  const items = Array.isArray(t?.items) ? t.items : [];
+  return {
+    id: String(t?.id || "").slice(0, 80),
+    name: String(t?.name || "").slice(0, 200),
+    items: items.map((i) => ({
+      id: String(i?.id || "").slice(0, 80),
+      question: String(i?.question || "").slice(0, 5000),
+      answer: String(i?.answer || "").slice(0, 20000),
+      note: String(i?.note || "").slice(0, 5000),
+      tags: Array.isArray(i?.tags) ? i.tags.slice(0, 20).map((x) => String(x).slice(0, 50)) : [],
+    })),
+  };
+}
+
+// "1.0.3" → "1.0.4"; অবৈধ হলে "1.0.1" থেকে শুরু
+function bumpPatch(v) {
+  const m = String(v || "").match(/^(\d+)\.(\d+)\.(\d+)$/);
+  if (!m) return "1.0.1";
+  return `${m[1]}.${m[2]}.${Number(m[3]) + 1}`;
+}
+
+async function handleAdminPrepSave(request, env) {
+  const raw = await request.text();
+  if (raw.length > MAX_PREP_BYTES) return text("Too large", 413);
+  let doc;
+  try {
+    doc = JSON.parse(raw);
+  } catch {
+    return text("Invalid JSON", 400);
+  }
+  if (!doc || !Array.isArray(doc.topics)) return text("Bad body", 400);
+
+  const current = await readR2Json(env, PREP_FILE, { version: "1.0.0" });
+  const version = bumpPatch(current.version);
+  const updatedAt = new Date().toISOString();
+
+  const next = {
+    version,
+    updatedAt,
+    topics: doc.topics.map(sanitizePrepTopic),
+  };
+
+  await writeR2Json(env, PREP_FILE, next, "public, max-age=60");
+  await writeR2Json(env, PREP_META_FILE, { version, updatedAt }, "public, max-age=60");
+  return json({ ok: true, version });
+}
+
+// ---------- Cron ----------
 async function expireDeadlines(env) {
   const now = new Date().toISOString();
   const placeholders = OPEN_STATUSES.map(() => "?").join(",");
@@ -760,9 +801,7 @@ async function expireDeadlines(env) {
 
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(
-      Promise.all([expireDeadlines(env), rotateExpiredJobs(env)])
-    );
+    ctx.waitUntil(Promise.all([expireDeadlines(env), rotateExpiredJobs(env)]));
   },
 
   async fetch(request, env) {
@@ -788,33 +827,15 @@ export default {
         const mobile = String(body?.mobile || "").replace(/\D/g, "");
         if (!isValidMobile(mobile)) return json({ ok: false, step, error: "সঠিক মোবাইল নম্বর দিন" }, 400);
 
-        step = "secrets";
-        const info = {
-          hasSaEmail: !!env.FIREBASE_SA_EMAIL,
-          hasSaKey: !!env.FIREBASE_SA_PRIVATE_KEY,
-          keyLength: (env.FIREBASE_SA_PRIVATE_KEY || "").length,
-          hasDomain: !!env.USER_EMAIL_DOMAIN,
-        };
-
         step = "pem";
         pemToDer(env.FIREBASE_SA_PRIVATE_KEY);
-
-        step = "import-key";
-        const dummy = pemToDer(env.FIREBASE_SA_PRIVATE_KEY);
-        await crypto.subtle.importKey(
-          "pkcs8",
-          dummy,
-          { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-          false,
-          ["sign"]
-        );
 
         step = "google-token";
         await getGoogleAccessToken(env);
 
         step = "lookup";
         const user = await lookupUserByMobile(env, mobile);
-        if (!user) return json({ ok: false, step, info, error: "এই নম্বরে কোনো অ্যাকাউন্ট নেই" }, 404);
+        if (!user) return json({ ok: false, step, error: "এই নম্বরে কোনো অ্যাকাউন্ট নেই" }, 404);
         if (ADMIN_EMAILS.includes((user.email || "").toLowerCase())) {
           return json({ ok: false, step, error: "অ্যাডমিন অ্যাকাউন্টে এভাবে লগইন করা যাবে না" }, 403);
         }
@@ -927,19 +948,6 @@ export default {
       return handleUserReview(reviewMatch[1], request, env, user);
     }
 
-        // ---------- আর্কাইব: সার্কুলার দেখা, সম্পাদনা, মোছা (অ্যাডমিন) ----------
-    const archiveAdminMatch = path.match(/^\/api\/admin\/archive\/([A-Za-z0-9_-]{3,120})$/);
-    if (archiveAdminMatch && ["GET", "PUT", "PATCH", "DELETE"].includes(request.method)) {
-      if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
-      return handleArchiveAdmin(archiveAdminMatch[1], request, env, request.method);
-    }
-
-        // ---------- চাকরির প্রস্তুতি: অ্যাডমিন সংরক্ষণ ----------
-    if (path === "/api/admin/prep" && request.method === "PUT") {
-      if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
-      return handleAdminPrepSave(request, env);
-    }
-
     // ---------- আবেদন: অ্যাডমিন ----------
     if (path === "/api/admin/applications" && request.method === "GET") {
       if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
@@ -968,7 +976,20 @@ export default {
       return handleAdminPipeline(pipeMatch[1], env);
     }
 
-    // ---------- জব সেভ (অ্যাডমিন টোকেন): চলমান ও আর্কাইব ভাগ হয় ----------
+    // ---------- আর্কাইব: অ্যাডমিন ----------
+    const archiveAdminMatch = path.match(/^\/api\/admin\/archive\/([A-Za-z0-9_-]{3,120})$/);
+    if (archiveAdminMatch && ["GET", "PUT", "PATCH", "DELETE"].includes(request.method)) {
+      if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
+      return handleArchiveAdmin(archiveAdminMatch[1], request, env, request.method);
+    }
+
+    // ---------- চাকরির প্রস্তুতি: অ্যাডমিন সংরক্ষণ ----------
+    if (path === "/api/admin/prep" && request.method === "PUT") {
+      if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
+      return handleAdminPrepSave(request, env);
+    }
+
+    // ---------- জব সেভ (অ্যাডমিন টোকেন) ----------
     if (path === "/admin/jobs/save" && request.method === "POST") {
       if (!isAdminToken) return text("Unauthorized", 401);
 
@@ -985,47 +1006,6 @@ export default {
       const result = await saveJobsWithArchive(env, jobs);
       return json({ ok: true, count: jobs.length, ...result });
     }
-
-    // ---------- চাকরির প্রস্তুতি: লিখিত প্রশ্ন-উত্তর (অ্যাডমিন সংরক্ষণ) ----------
-const PREP_FILE = "prep-data.json";
-const MAX_PREP_BYTES = 3000000;
-
-function sanitizePrepTopic(t) {
-  const items = Array.isArray(t?.items) ? t.items : [];
-  return {
-    id: String(t?.id || "").slice(0, 80),
-    name: String(t?.name || "").slice(0, 200),
-    items: items.map((i) => ({
-      id: String(i?.id || "").slice(0, 80),
-      question: String(i?.question || "").slice(0, 5000),
-      answer: String(i?.answer || "").slice(0, 20000),
-      note: String(i?.note || "").slice(0, 5000),
-      tags: Array.isArray(i?.tags) ? i.tags.slice(0, 20).map((x) => String(x).slice(0, 50)) : [],
-    })),
-  };
-}
-
-async function handleAdminPrepSave(request, env) {
-  const raw = await request.text();
-  if (raw.length > MAX_PREP_BYTES) return text("Too large", 413);
-  let doc;
-  try {
-    doc = JSON.parse(raw);
-  } catch {
-    return text("Invalid JSON", 400);
-  }
-  if (!doc || !Array.isArray(doc.topics)) return text("Bad body", 400);
-
-  const current = await readR2Json(env, PREP_FILE, { version: 0 });
-  const next = {
-    version: (Number(current.version) || 0) + 1,
-    updatedAt: new Date().toISOString(),
-    topics: doc.topics.map(sanitizePrepTopic),
-  };
-  // সংস্করণ বাড়লে ডিভাইস নতুন ডেটা নেবে; ক্যাশ ছোট রাখা হয়েছে
-  await writeR2Json(env, PREP_FILE, next, "public, max-age=60");
-  return json({ ok: true, version: next.version });
-}
 
     // ---------- পাবলিক JSON লেখা (অ্যাডমিন টোকেন) ----------
     const publicMatch = path.match(/^\/admin\/public\/([a-z-]+)$/);
