@@ -425,6 +425,14 @@ async function saveJobsWithArchive(env, posted) {
   const now = Date.now();
   const live = posted.filter((j) => isLiveJob(j, now));
   const expired = posted.filter((j) => !isLiveJob(j, now));
+
+  // আর্কাইবে থাকা সার্কুলার আবার চলমান হলে আর্কাইব থেকে সরবে (দুই জায়গায় থাকবে না)
+  const index = await readR2Json(env, ARCHIVE_INDEX_FILE, []);
+  for (const j of live) {
+    const entry = index.find((e) => e.id === j.id);
+    if (entry) await removeArchivedJob(env, j.id, entry.month);
+  }
+
   await archiveJobs(env, expired);
   await writeActiveJobs(env, live);
   return { live: live.length, archived: expired.length };
