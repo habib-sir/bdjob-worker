@@ -19,6 +19,7 @@ const URGENT_MS = 2 * 24 * 60 * 60 * 1000;
 const ARCHIVE_GRACE_MS = 2 * 24 * 60 * 60 * 1000;
 const ACTIVE_JOBS_FILE = "jobs.json";
 const FEED_LIMIT = 15;
+const httpOrNull = (u) => (typeof u === "string" && /^https:\/\//.test(u) ? u : null);
 const ARCHIVE_INDEX_FILE = "jobs/archive/index.json";
 
 // ---------- চাকরির প্রস্তুতি ----------
@@ -328,7 +329,7 @@ async function writeActiveJobs(env, activeJobs) {
       deadline: j.deadline,
       publishedAt: j.publishedAt,
       applyServiceEnabled: Boolean(j.applyServiceEnabled),
-      featuredImage: j.featuredImage || j.circularImages?.[0] || null,
+      featuredImage: httpOrNull(j.featuredImage) || httpOrNull(j.circularImages?.[0]),
     }))
     .slice(0, FEED_LIMIT);
 
