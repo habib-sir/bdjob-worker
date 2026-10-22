@@ -489,8 +489,12 @@ async function handleStudyUpload(request, env) {
 
 async function cleanupStudyVersions(env) {
   const list = await env.BUCKET.list({ prefix: "study/" });
-  const objs = (list.objects || []).sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded));
-  for (const o of objs.slice(STUDY_KEEP)) await env.BUCKET.delete(o.key);
+  const objs = (list.objects || []).sort(
+    (a, b) => new Date(b.uploaded).getTime() - new Date(a.uploaded).getTime()
+  );
+  for (const o of objs.slice(STUDY_KEEP)) {
+    await env.BUCKET.delete(o.key);
+  }
 }
 
 async function handleSubmitApplication(request, env, user) {
