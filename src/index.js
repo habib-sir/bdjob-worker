@@ -10,6 +10,7 @@ const MAX_UPLOAD_BYTES = 500000;
 const MAX_FILE_CHARS = 1400000;
 const MAX_APPLICATION_CHARS = 60000;
 const MAX_PREP_BYTES = 3000000;
+const STUDY_KEEP = 1; // শুধু সর্বশেষ একটি স্টাডি ভার্সন R2-তে থাকবে
 const RESET_MAX_FAILS = 5;
 const RESET_BLOCK_MS = 30 * 60 * 1000;
 const URGENT_MS = 2 * 24 * 60 * 60 * 1000;
@@ -457,6 +458,38 @@ function dateCode(d = new Date()) {
 async function findJobForApplication(env, jobId) {
   const active = await readR2Json(env, ACTIVE_JOBS_FILE, []);
   return active.find((j) => j.id === jobId || j.slug === jobId) || null;
+}
+
+async function handleStudyUpload(request, env) {
+  const raw = await request.text();
+  if (raw.length > 2000000) return text("Too large", 413);
+  if (!/<html/i.test(raw)) return text("Not an HTML file", 400);
+
+  const version = Date.now().toString(36);
+  const body = /<\/head>/i.test(raw)
+    ? raw.replace(/<\/head>/i, `<script>window.STUDY_VERSION="${version}";</script></head>`)
+    : `<script>window.STUDY_VERSION="${version}";</script>${raw}`;
+
+  await env.BUCKET.put(`study/${version}.html`, body, {
+    httpMetadata: { contentType: "text/html; charset=utf-8", cacheControl: "public, max-age=31536000, immutable" },
+  });
+  await env.BUCKET.put("study-material.html", body, {
+    httpMetadata: { contentType: "text/html; charset=utf-8", cacheControl: "public, max-age=300" },
+  });
+  await env.BUCKET.put(
+    "study-material-meta.json",
+    JSON.stringify({ version, updatedAt: new Date().toISOString() }),
+    { httpMetadata: { contentType: "application/json", cacheControl: "public, max-age=300" } }
+  );
+
+  await cleanupStudyVersions(env);
+  return json({ ok: true, version });
+}
+
+async function cleanupStudyVersions(env) {
+  const list = await env.BUCKET.list({ prefix: "study/" });
+  const objs = (list.objects || []).sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded));
+  for (const o of objs.slice(STUDY_KEEP)) await env.BUCKET.delete(o.key);
 }
 
 async function handleSubmitApplication(request, env, user) {
@@ -981,6 +1014,12 @@ export default {
     if (archiveAdminMatch && ["GET", "PUT", "PATCH", "DELETE"].includes(request.method)) {
       if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
       return handleArchiveAdmin(archiveAdminMatch[1], request, env, request.method);
+    }
+
+        // ---------- স্টাডি মেটেরিয়াল: আপলোড (অ্যাডমিন টোকেন বা অ্যাডমিন ইমেইল) ----------
+    if (path === "/api/admin/study-material" && request.method === "PUT") {
+      if (!isAdminToken && !(await requireAdmin(request, env))) return text("Forbidden", 403);
+      return handleStudyUpload(request, env);
     }
 
     // ---------- চাকরির প্রস্তুতি: অ্যাডমিন সংরক্ষণ ----------
