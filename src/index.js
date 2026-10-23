@@ -10,21 +10,25 @@ const MAX_UPLOAD_BYTES = 500000;
 const MAX_FILE_CHARS = 1400000;
 const MAX_APPLICATION_CHARS = 60000;
 const MAX_PREP_BYTES = 3000000;
-const STUDY_KEEP = 1; // শুধু সর্বশেষ একটি স্টাডি ভার্সন R2-তে থাকবে
 const RESET_MAX_FAILS = 5;
 const RESET_BLOCK_MS = 30 * 60 * 1000;
 const URGENT_MS = 2 * 24 * 60 * 60 * 1000;
 
-// ---------- সার্কুলার আর্কাইব ----------
+// ---------- সার্কুলার আর্কাইব ও ভাগ ----------
 const ARCHIVE_GRACE_MS = 2 * 24 * 60 * 60 * 1000;
 const ACTIVE_JOBS_FILE = "jobs.json";
 const FEED_LIMIT = 15;
-const httpOrNull = (u) => (typeof u === "string" && /^https:\/\//.test(u) ? u : null);
 const ARCHIVE_INDEX_FILE = "jobs/archive/index.json";
+const PUBLIC_BASE = "https://files.bdjobapply.site/";
+const JOB_IMAGE_PREFIX = "jobs/images/";
+const MAX_JOB_IMAGE_BYTES = 3000000;
 
 // ---------- চাকরির প্রস্তুতি ----------
 const PREP_FILE = "prep-data.json";
 const PREP_META_FILE = "prep-meta.json";
+
+// ---------- স্টাডি মেটেরিয়াল ----------
+const STUDY_KEEP = 1;
 
 const APP_STATUSES = ["waiting", "apply_now", "checking", "correction", "payment_now", "applied", "rejected", "cancelled"];
 const OPEN_STATUSES = ["waiting", "apply_now", "checking", "correction", "payment_now"];
@@ -293,7 +297,61 @@ async function writeR2Json(env, key, data, cacheControl = "public, max-age=60") 
   });
 }
 
-// ---------- সার্কুলার: চলমান / আর্কাইব ----------
+// ---------- ছবি: base64 → R2 ফাইল ----------
+const DATA_IMAGE_RE = /data:image\/(?:jpeg|jpg|png|webp|gif);base64,[A-Za-z0-9+/=]+/g;
+
+async function storeDataImage(env, dataUrl) {
+  const m = String(dataUrl).match(/^data:image\/(jpeg|jpg|png|webp|gif);base64,(.+)$/s);
+  if (!m) return null;
+  const mime = `image/${m[1] === "jpg" ? "jpeg" : m[1]}`;
+  const ext = m[1] === "jpeg" || m[1] === "jpg" ? "jpg" : m[1];
+
+  const bin = atob(m[2]);
+  if (bin.length > MAX_JOB_IMAGE_BYTES) return null;
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  const hex = [...digest].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+  const key = `${JOB_IMAGE_PREFIX}${hex}.${ext}`;
+
+  if (!(await env.BUCKET.head(key))) {
+    await env.BUCKET.put(key, bytes, {
+      httpMetadata: { contentType: mime, cacheControl: "public, max-age=31536000, immutable" },
+    });
+  }
+  return `${PUBLIC_BASE}${key}`;
+}
+
+async function externalizeImages(env, job) {
+  const out = { ...job };
+  if (typeof out.featuredImage === "string" && out.featuredImage.startsWith("data:")) {
+    out.featuredImage = (await storeDataImage(env, out.featuredImage)) || null;
+  }
+  if (Array.isArray(out.circularImages)) {
+    const list = [];
+    for (const u of out.circularImages) {
+      if (typeof u === "string" && u.startsWith("data:")) {
+        const r = await storeDataImage(env, u);
+        if (r) list.push(r);
+      } else if (u) {
+        list.push(u);
+      }
+    }
+    out.circularImages = list;
+  }
+  if (typeof out.content === "string" && out.content.includes("data:image")) {
+    let html = out.content;
+    for (const m of [...html.matchAll(DATA_IMAGE_RE)]) {
+      const url = await storeDataImage(env, m[0]);
+      if (url) html = html.split(m[0]).join(url);
+    }
+    out.content = html;
+  }
+  return out;
+}
+
+// ---------- সার্কুলার: চলমান / আর্কাইব / বিবরণ ----------
 const jobEndTime = (j) => {
   if (!j || !j.deadline) return null;
   const t = new Date(j.deadline).getTime();
@@ -315,11 +373,25 @@ const archiveMonthOf = (j) => {
 };
 
 const archiveFileOf = (month) => `jobs/archive/${month}.json`;
+const detailKeyOf = (j) => `jobs/detail/${j.slug || j.id}.json`;
 
-async function writeActiveJobs(env, activeJobs) {
-  await writeR2Json(env, ACTIVE_JOBS_FILE, activeJobs, "public, max-age=60");
+// তালিকায় থাকবে শুধু হালকা অংশ (বিবরণ ও বড় ছবির তালিকা বাদ)
+function listEntry(job) {
+  const { content, circularImages, ...rest } = job;
+  return rest;
+}
 
-  const feedPosts = activeJobs
+// বিবরণ ফাইল থেকে পূর্ণ তথ্য মেলানো (সেভ বা আর্কাইবের সময় বিবরণ হারাতে না দিতে)
+async function fullJob(env, job) {
+  if (job.content !== undefined && job.circularImages !== undefined) return job;
+  const old = await readR2Json(env, detailKeyOf(job), null);
+  return old ? { ...old, ...job } : job;
+}
+
+async function writeActiveJobs(env, activeList) {
+  await writeR2Json(env, ACTIVE_JOBS_FILE, activeList, "public, max-age=60");
+
+  const feedPosts = activeList
     .filter((j) => j.status !== "draft")
     .map((j) => ({
       id: j.id,
@@ -329,7 +401,7 @@ async function writeActiveJobs(env, activeJobs) {
       deadline: j.deadline,
       publishedAt: j.publishedAt,
       applyServiceEnabled: Boolean(j.applyServiceEnabled),
-      featuredImage: httpOrNull(j.featuredImage) || httpOrNull(j.circularImages?.[0]),
+      featuredImage: j.featuredImage || null,
     }))
     .slice(0, FEED_LIMIT);
 
@@ -374,10 +446,17 @@ async function removeArchivedJob(env, id, month) {
   await writeR2Json(env, ARCHIVE_INDEX_FILE, index.filter((e) => e.id !== id), "public, max-age=3600");
 }
 
+// অ্যাডমিন যে তালিকা পাঠায় তা সংরক্ষণ: ছবি বাইরে, বিবরণ আলাদা, চলমান ও আর্কাইব ভাগ
 async function saveJobsWithArchive(env, posted) {
   const now = Date.now();
-  const live = posted.filter((j) => isLiveJob(j, now));
-  const expired = posted.filter((j) => !isLiveJob(j, now));
+  const prepared = [];
+  for (const raw of posted) {
+    const merged = await fullJob(env, raw);
+    prepared.push(await externalizeImages(env, merged));
+  }
+
+  const live = prepared.filter((j) => isLiveJob(j, now));
+  const expired = prepared.filter((j) => !isLiveJob(j, now));
 
   // আর্কাইবে থাকা সার্কুলার আবার চলমান হলে আর্কাইব থেকে সরবে
   const index = await readR2Json(env, ARCHIVE_INDEX_FILE, []);
@@ -387,16 +466,23 @@ async function saveJobsWithArchive(env, posted) {
   }
 
   await archiveJobs(env, expired);
-  await writeActiveJobs(env, live);
+  for (const j of live) {
+    await writeR2Json(env, detailKeyOf(j), j, "public, max-age=60");
+  }
+  await writeActiveJobs(env, live.map(listEntry));
   return { live: live.length, archived: expired.length };
 }
 
+// Cron: মেয়াদ শেষ সার্কুলার তালিকা থেকে আর্কাইবে (পূর্ণ তথ্যসহ)
 async function rotateExpiredJobs(env) {
   const active = await readR2Json(env, ACTIVE_JOBS_FILE, []);
   const now = Date.now();
   const keep = active.filter((j) => isLiveJob(j, now));
-  const move = active.filter((j) => !isLiveJob(j, now));
-  if (move.length === 0) return;
+  const moveEntries = active.filter((j) => !isLiveJob(j, now));
+  if (moveEntries.length === 0) return;
+
+  const move = [];
+  for (const j of moveEntries) move.push(await fullJob(env, j));
   await archiveJobs(env, move);
   await writeActiveJobs(env, keep);
 }
@@ -429,13 +515,14 @@ async function handleArchiveAdmin(id, request, env, method) {
     return text("Invalid JSON", 400);
   }
 
-  const next = { ...job, ...body, id };
+  const next = await externalizeImages(env, { ...job, ...body, id });
   delete next.archived;
 
   if (isLiveJob(next, Date.now())) {
     await removeArchivedJob(env, id, entry.month);
+    await writeR2Json(env, detailKeyOf(next), next, "public, max-age=60");
     const active = await readR2Json(env, ACTIVE_JOBS_FILE, []);
-    await writeActiveJobs(env, [next, ...active.filter((j) => j.id !== id)]);
+    await writeActiveJobs(env, [listEntry(next), ...active.filter((j) => j.id !== id)]);
     return json({ ok: true, moved: "active" });
   }
 
@@ -459,42 +546,6 @@ function dateCode(d = new Date()) {
 async function findJobForApplication(env, jobId) {
   const active = await readR2Json(env, ACTIVE_JOBS_FILE, []);
   return active.find((j) => j.id === jobId || j.slug === jobId) || null;
-}
-
-async function handleStudyUpload(request, env) {
-  const raw = await request.text();
-  if (raw.length > 2000000) return text("Too large", 413);
-  if (!/<html/i.test(raw)) return text("Not an HTML file", 400);
-
-  const version = Date.now().toString(36);
-  const body = /<\/head>/i.test(raw)
-    ? raw.replace(/<\/head>/i, `<script>window.STUDY_VERSION="${version}";</script></head>`)
-    : `<script>window.STUDY_VERSION="${version}";</script>${raw}`;
-
-  await env.BUCKET.put(`study/${version}.html`, body, {
-    httpMetadata: { contentType: "text/html; charset=utf-8", cacheControl: "public, max-age=31536000, immutable" },
-  });
-  await env.BUCKET.put("study-material.html", body, {
-    httpMetadata: { contentType: "text/html; charset=utf-8", cacheControl: "public, max-age=300" },
-  });
-  await env.BUCKET.put(
-    "study-material-meta.json",
-    JSON.stringify({ version, updatedAt: new Date().toISOString() }),
-    { httpMetadata: { contentType: "application/json", cacheControl: "public, max-age=300" } }
-  );
-
-  await cleanupStudyVersions(env);
-  return json({ ok: true, version });
-}
-
-async function cleanupStudyVersions(env) {
-  const list = await env.BUCKET.list({ prefix: "study/" });
-  const objs = (list.objects || []).sort(
-    (a, b) => new Date(b.uploaded).getTime() - new Date(a.uploaded).getTime()
-  );
-  for (const o of objs.slice(STUDY_KEEP)) {
-    await env.BUCKET.delete(o.key);
-  }
 }
 
 async function handleSubmitApplication(request, env, user) {
@@ -758,7 +809,7 @@ async function handleAdminPipeline(status, env) {
   return json({ status, numbers });
 }
 
-// ---------- চাকরির প্রস্তুতি: অ্যাডমিন সংরক্ষণ ----------
+// ---------- চাকরির প্রস্তুতি ----------
 function sanitizePrepTopic(t) {
   const items = Array.isArray(t?.items) ? t.items : [];
   return {
@@ -774,7 +825,6 @@ function sanitizePrepTopic(t) {
   };
 }
 
-// "1.0.3" → "1.0.4"; অবৈধ হলে "1.0.1" থেকে শুরু
 function bumpPatch(v) {
   const m = String(v || "").match(/^(\d+)\.(\d+)\.(\d+)$/);
   if (!m) return "1.0.1";
@@ -807,7 +857,44 @@ async function handleAdminPrepSave(request, env) {
   return json({ ok: true, version });
 }
 
-// ---------- Cron ----------
+// ---------- স্টাডি মেটেরিয়াল: আপলোড ও শুধু সর্বশেষ ভার্সন ----------
+async function handleStudyUpload(request, env) {
+  const raw = await request.text();
+  if (raw.length > 2000000) return text("Too large", 413);
+  if (!/<html/i.test(raw)) return text("Not an HTML file", 400);
+
+  const version = Date.now().toString(36);
+  const body = /<\/head>/i.test(raw)
+    ? raw.replace(/<\/head>/i, `<script>window.STUDY_VERSION="${version}";</script></head>`)
+    : `<script>window.STUDY_VERSION="${version}";</script>${raw}`;
+
+  await env.BUCKET.put(`study/${version}.html`, body, {
+    httpMetadata: { contentType: "text/html; charset=utf-8", cacheControl: "public, max-age=31536000, immutable" },
+  });
+  await env.BUCKET.put("study-material.html", body, {
+    httpMetadata: { contentType: "text/html; charset=utf-8", cacheControl: "public, max-age=300" },
+  });
+  await env.BUCKET.put(
+    "study-material-meta.json",
+    JSON.stringify({ version, updatedAt: new Date().toISOString() }),
+    { httpMetadata: { contentType: "application/json", cacheControl: "public, max-age=300" } }
+  );
+
+  await cleanupStudyVersions(env);
+  return json({ ok: true, version });
+}
+
+async function cleanupStudyVersions(env) {
+  const list = await env.BUCKET.list({ prefix: "study/" });
+  const objs = (list.objects || []).sort(
+    (a, b) => new Date(b.uploaded).getTime() - new Date(a.uploaded).getTime()
+  );
+  for (const o of objs.slice(STUDY_KEEP)) {
+    await env.BUCKET.delete(o.key);
+  }
+}
+
+// ---------- Cron: ডেডলাইন পার হলে আবেদন ক্যান্সেল ----------
 async function expireDeadlines(env) {
   const now = new Date().toISOString();
   const placeholders = OPEN_STATUSES.map(() => "?").join(",");
@@ -835,6 +922,13 @@ async function expireDeadlines(env) {
 
   for (const r of rows) await rebuildPipeline(env, r.status);
   await rebuildPipeline(env, "cancelled");
+}
+
+// ---------- এক বার চালানো: পুরনো jobs.json ভাগ করা ----------
+async function migrateJobs(env) {
+  const all = await readR2Json(env, ACTIVE_JOBS_FILE, []);
+  const result = await saveJobsWithArchive(env, all);
+  return json({ ok: true, total: all.length, ...result });
 }
 
 export default {
@@ -1021,19 +1115,19 @@ export default {
       return handleArchiveAdmin(archiveAdminMatch[1], request, env, request.method);
     }
 
-        // ---------- স্টাডি মেটেরিয়াল: আপলোড (অ্যাডমিন টোকেন বা অ্যাডমিন ইমেইল) ----------
-    if (path === "/api/admin/study-material" && request.method === "PUT") {
-      if (!isAdminToken && !(await requireAdmin(request, env))) return text("Forbidden", 403);
-      return handleStudyUpload(request, env);
-    }
-
     // ---------- চাকরির প্রস্তুতি: অ্যাডমিন সংরক্ষণ ----------
     if (path === "/api/admin/prep" && request.method === "PUT") {
       if (!(await requireAdmin(request, env))) return text("Forbidden", 403);
       return handleAdminPrepSave(request, env);
     }
 
-    // ---------- জব সেভ (অ্যাডমিন টোকেন) ----------
+    // ---------- স্টাডি মেটেরিয়াল: আপলোড (অ্যাডমিন টোকেন বা অ্যাডমিন ইমেইল) ----------
+    if (path === "/api/admin/study-material" && request.method === "PUT") {
+      if (!isAdminToken && !(await requireAdmin(request, env))) return text("Forbidden", 403);
+      return handleStudyUpload(request, env);
+    }
+
+    // ---------- জব সেভ (অ্যাডমিন টোকেন): ছবি বাইরে, বিবরণ আলাদা, চলমান/আর্কাইব ভাগ ----------
     if (path === "/admin/jobs/save" && request.method === "POST") {
       if (!isAdminToken) return text("Unauthorized", 401);
 
@@ -1049,6 +1143,12 @@ export default {
 
       const result = await saveJobsWithArchive(env, jobs);
       return json({ ok: true, count: jobs.length, ...result });
+    }
+
+    // ---------- এক বার: পুরনো jobs.json ভাগ করা ----------
+    if (path === "/admin/jobs/migrate" && request.method === "POST") {
+      if (!isAdminToken) return text("Unauthorized", 401);
+      return migrateJobs(env);
     }
 
     // ---------- পাবলিক JSON লেখা (অ্যাডমিন টোকেন) ----------
@@ -1095,7 +1195,7 @@ export default {
       await env.BUCKET.put(key, buf, {
         httpMetadata: { contentType: type, cacheControl: "public, max-age=3600" },
       });
-      return json({ ok: true, url: `https://files.bdjobapply.site/${key}` });
+      return json({ ok: true, url: `${PUBLIC_BASE}${key}` });
     }
 
     // ---------- কভার ইমেজ (অ্যাডমিন ইমেইল, পাবলিক R2) ----------
