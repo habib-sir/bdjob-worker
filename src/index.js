@@ -924,6 +924,37 @@ async function expireDeadlines(env) {
   await rebuildPipeline(env, "cancelled");
 }
 
+// ---------- এক বার: পুরনো r2.dev URL → files.bdjobapply.site ----------
+const OLD_R2_HOST = "https://pub-1c4d2bdddd5d943c38d6824eeb890c6f0.r2.dev/";
+
+async function rewriteHostInKey(env, key) {
+  const obj = await env.BUCKET.get(key);
+  if (!obj) return 0;
+  const raw = await obj.text();
+  if (!raw.includes(OLD_R2_HOST)) return 0;
+  await env.BUCKET.put(key, raw.split(OLD_R2_HOST).join(PUBLIC_BASE), {
+    httpMetadata: obj.httpMetadata,
+  });
+  return 1;
+}
+
+async function handleRewriteHost(env) {
+  let changed = 0;
+  changed += await rewriteHostInKey(env, ACTIVE_JOBS_FILE);
+  changed += await rewriteHostInKey(env, "feed.json");
+
+  for (const prefix of ["jobs/detail/", "jobs/archive/"]) {
+    let cursor;
+    do {
+      const list = await env.BUCKET.list({ prefix, cursor });
+      for (const o of list.objects || []) {
+        changed += await rewriteHostInKey(env, o.key);
+      }
+      cursor = list.truncated ? list.cursor : undefined;
+    } while (cursor);
+  }
+  return json({ ok: true, changed });
+}
 // ---------- এক বার চালানো: পুরনো jobs.json ভাগ করা ----------
 async function migrateJobs(env) {
   const all = await readR2Json(env, ACTIVE_JOBS_FILE, []);
@@ -941,9 +972,23 @@ export default {
       return new Response(null, { headers: cors() });
     }
 
-    const url = new URL(request.url);
+        const url = new URL(request.url);
     const path = url.pathname;
     const isAdminToken = request.headers.get("Authorization") === `Bearer ${env.ADMIN_TOKEN}`;
+
+    // ... (বাকি সব আগের রুট যেমন ছিল তেমন থাকবে) ...
+
+    // ---------- এক বার: পুরনো r2.dev ছবির URL বদলানো ----------
+    if (path === "/admin/jobs/rewrite-host" && request.method === "POST") {
+      if (!isAdminToken) return text("Unauthorized", 401);
+      return handleRewriteHost(env);
+    }
+
+    // ---------- এক বার: পুরনো jobs.json ভাগ করা ----------
+    if (path === "/admin/jobs/migrate" && request.method === "POST") {
+      if (!isAdminToken) return text("Unauthorized", 401);
+      return migrateJobs(env);
+    }
 
     // ---------- মাস্টার: যেকোনো ব্যবহারকারীর হয়ে লগইন ----------
     if (path === "/admin/impersonate" && request.method === "POST") {
