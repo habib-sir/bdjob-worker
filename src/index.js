@@ -925,7 +925,7 @@ async function expireDeadlines(env) {
 }
 
 // ---------- এক বার: পুরনো r2.dev URL → files.bdjobapply.site ----------
-const OLD_R2_HOST = "https://pub-1c4d2bdddd5d943c38d6824eeb890c6f0.r2.dev/";
+ const OLD_R2_HOST = "https://pub-1c4d2bddd5d943c38d6824eeb890c6f0.r2.dev/";
 
 async function rewriteHostInKey(env, key) {
   const obj = await env.BUCKET.get(key);
