@@ -36,6 +36,7 @@ const OPEN_STATUSES = ["waiting", "apply_now", "checking", "correction", "paymen
 const PUBLIC_JSON_FILES = {
   "settings-payment": "settings-payment.json",
   "exams": "exams.json",
+  "salary-scales": "salary-scales.json",
 };
 
 const UPLOAD_FOLDERS = ["exams"];
