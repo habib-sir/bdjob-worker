@@ -672,6 +672,9 @@ async function handleUserReview(id, request, env, user) {
     if (!note) return text("সংশোধনের বিবরণ লিখুন", 400);
     nextStatus = "correction";
     data.correctionNote = note;
+    data.correctionFields = Array.isArray(body.fields)
+      ? body.fields.map((field) => String(field).trim()).filter(Boolean).slice(0, 10)
+      : [];
   } else {
     return text("Bad action", 400);
   }
