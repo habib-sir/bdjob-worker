@@ -63,6 +63,31 @@ function text(msg, status = 200) {
   return new Response(msg, { status, headers: cors() });
 }
 
+const JOB_JSON_INSTRUCTION = `চাকরির circular-এর তথ্য পড়ে শুধুমাত্র valid JSON দিন। কোনো তথ্য অনুমান করবেন না; অজানা তথ্য null, 0 বা [] রাখুন। প্রতিটি পদ posts array-তে দিন। পদসংখ্যা না থাকলে count:null, সরকারি grade না থাকলে salaryGrade:null এবং বেতন লেখা আকারে থাকলে salaryText ব্যবহার করুন। title, organizationName, deadline, applicationStartDate, applyLink, circularLink, applicationFee, serviceCharge, posts, content, seoTitle, metaDescription, focusKeyword ও tags পূরণ করুন। SEO title সর্বোচ্চ ৬৫ অক্ষর এবং metaDescription ১৪০–১৬০ অক্ষরের রাখুন। applyServiceEnabled:false ও status:draft রাখুন। JSON-এর বাইরে কোনো লেখা দেবেন না। Structure: {"title":"","slug":"","category":"govt","content":"","deadline":null,"applicationStartDate":null,"applyLink":null,"circularLink":null,"organizationName":"","employmentType":"","location":{"addressLocality":"বাংলাদেশ","addressRegion":"","streetAddress":"","postalCode":""},"baseSalary":{"grade":null,"currency":"BDT","minValue":null,"maxValue":null,"unitText":"মাসিক"},"applyServiceEnabled":false,"applicationFee":0,"serviceCharge":0,"posts":[{"name":"","count":null,"district":"ALL","districts":[],"salaryGrade":null,"salaryText":"","salaryMin":null,"salaryMax":null,"applicationFee":0,"serviceCharge":0}],"seoTitle":"","metaDescription":"","focusKeyword":"","tags":[],"status":"draft"}`;
+
+async function generateJobJson(env, sourceParts) {
+  if (!env.GEMINI_API_KEY) return { error: "OCR/AI service configured নয়", status: 503 };
+  const aiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: JOB_JSON_INSTRUCTION }, ...sourceParts] }],
+      generationConfig: { responseMimeType: "application/json", temperature: 0.1 },
+    }),
+  });
+  if (!aiRes.ok) return { error: "AI service থেকে উত্তর পাওয়া যায়নি", status: 502 };
+  const aiBody = await aiRes.json();
+  const raw = aiBody?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("").trim();
+  if (!raw) return { error: "AI কোনো উত্তর দেয়নি", status: 422 };
+  try {
+    const parsed = JSON.parse(raw.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim());
+    if (!parsed.title || !Array.isArray(parsed.posts)) return { error: "AI response-এ title বা posts নেই", status: 422 };
+    return { data: parsed, status: 200 };
+  } catch {
+    return { error: "AI response valid JSON নয়", status: 502 };
+  }
+}
+
 async function handleAdminCircularOcr(request, env) {
   if (!env.GEMINI_API_KEY) return json({ error: "OCR service configured নয়" }, 503);
   const body = await request.json().catch(() => null);
@@ -71,26 +96,33 @@ async function handleAdminCircularOcr(request, env) {
   if (!match) return json({ error: "JPG, PNG বা WebP image দিন" }, 400);
   if (match[2].length > MAX_OCR_IMAGE_CHARS) return json({ error: "ছবিটি সর্বোচ্চ ৭.৫ MB হতে পারবে" }, 413);
 
-  const prompt = `এই চাকরির circular image-এর বাংলা/ইংরেজি লেখা পড়ে শুধুমাত্র valid JSON দিন। কোনো তথ্য অনুমান করবেন না; অজানা তথ্য null, 0 বা [] রাখুন। প্রতিটি পদ posts array-তে দিন। পদসংখ্যা না থাকলে count:null, সরকারি grade না থাকলে salaryGrade:null এবং বেতন লেখা আকারে থাকলে salaryText ব্যবহার করুন। title, organizationName, deadline, applicationStartDate, applyLink, applicationFee, serviceCharge, posts, content, seoTitle, metaDescription, focusKeyword ও tags পূরণ করুন। SEO title সর্বোচ্চ ৬৫ অক্ষর এবং metaDescription ১৪০–১৬০ অক্ষরের রাখুন। applyServiceEnabled:false ও status:draft রাখুন। JSON-এর বাইরে কোনো লেখা দেবেন না। Structure: {"title":"","slug":"","category":"govt","content":"","deadline":null,"applicationStartDate":null,"applyLink":null,"organizationName":"","employmentType":"","location":{"addressLocality":"বাংলাদেশ","addressRegion":"","streetAddress":"","postalCode":""},"baseSalary":{"grade":null,"currency":"BDT","minValue":null,"maxValue":null,"unitText":"মাসিক"},"applyServiceEnabled":false,"applicationFee":0,"serviceCharge":0,"posts":[{"name":"","count":null,"district":"ALL","districts":[],"salaryGrade":null,"salaryText":"","salaryMin":null,"salaryMax":null,"applicationFee":0,"serviceCharge":0}],"seoTitle":"","metaDescription":"","focusKeyword":"","tags":[],"status":"draft"}`;
-  const aiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }, { inline_data: { mime_type: match[1], data: match[2] } }] }],
-      generationConfig: { response_mime_type: "application/json", temperature: 0.1 },
-    }),
-  });
-  if (!aiRes.ok) return json({ error: "OCR AI service থেকে উত্তর পাওয়া যায়নি" }, 502);
-  const aiBody = await aiRes.json();
-  const raw = aiBody?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("").trim();
-  if (!raw) return json({ error: "ছবি থেকে তথ্য পড়া যায়নি" }, 422);
-  try {
-    const parsed = JSON.parse(raw.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim());
-    if (!parsed.title) return json({ error: "ছবি থেকে চাকরির শিরোনাম শনাক্ত করা যায়নি" }, 422);
-    return json(parsed);
-  } catch {
-    return json({ error: "OCR response valid JSON নয়" }, 502);
+  const result = await generateJobJson(env, [{ inlineData: { mimeType: match[1], data: match[2] } }]);
+  return result.data ? json(result.data) : json({ error: result.error }, result.status);
+}
+
+async function handleAdminJobUrlExtract(request, env) {
+  const body = await request.json().catch(() => null);
+  let sourceText = String(body?.rawText || "").trim();
+  const sourceUrl = String(body?.url || "").trim();
+  if (!sourceText && sourceUrl) {
+    let parsed;
+    try { parsed = new URL(sourceUrl); } catch { return json({ error: "সঠিক http/https circular link দিন" }, 400); }
+    if (!/^https?:$/.test(parsed.protocol)) return json({ error: "শুধু public http/https link গ্রহণ করা হয়" }, 400);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch(parsed.toString(), { redirect: "follow", signal: controller.signal, headers: { "User-Agent": "BDJobApply-CircularReader/1.0" } });
+      if (!response.ok) return json({ error: `Circular page পড়া যায়নি (HTTP ${response.status})` }, 502);
+      const type = response.headers.get("content-type") || "";
+      if (!type.includes("text/html") && !type.includes("text/plain") && !type.includes("application/json")) return json({ error: "Link-এ readable text পাওয়া যায়নি; circular text paste করুন" }, 415);
+      sourceText = (await response.text()).slice(0, 1_200_000).replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    } catch (err) {
+      return json({ error: "এই website থেকে public text পড়া যায়নি; page-এর text copy করে paste করুন" }, 502);
+    } finally { clearTimeout(timer); }
   }
+  if (!sourceText) return json({ error: "Circular link অথবা text দিন" }, 400);
+  const result = await generateJobJson(env, [{ text: sourceText.slice(0, 1_200_000) }]);
+  return result.data ? json(result.data) : json({ error: result.error }, result.status);
 }
 
 const isValidMobile = (m) => /^01[3-9]\d{8}$/.test(String(m || ""));
@@ -1014,6 +1046,10 @@ export default {
     if (path === "/api/admin/ai/extract-job-image" && request.method === "POST") {
       if (!isAdminToken) return text("Unauthorized", 401);
       return handleAdminCircularOcr(request, env);
+    }
+    if (path === "/api/admin/ai/extract-job" && request.method === "POST") {
+      if (!isAdminToken) return text("Unauthorized", 401);
+      return handleAdminJobUrlExtract(request, env);
     }
 
     // ... (বাকি সব আগের রুট যেমন ছিল তেমন থাকবে) ...
