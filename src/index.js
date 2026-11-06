@@ -41,6 +41,7 @@ const PUBLIC_JSON_FILES = {
 
 const UPLOAD_FOLDERS = ["exams"];
 const IMAGE_TYPES = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
+const MAX_OCR_IMAGE_CHARS = 10_000_000;
 
 function cors(extra = {}) {
   return {
@@ -60,6 +61,36 @@ function json(obj, status = 200) {
 
 function text(msg, status = 200) {
   return new Response(msg, { status, headers: cors() });
+}
+
+async function handleAdminCircularOcr(request, env) {
+  if (!env.GEMINI_API_KEY) return json({ error: "OCR service configured নয়" }, 503);
+  const body = await request.json().catch(() => null);
+  const imageData = String(body?.imageData || "");
+  const match = imageData.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/i);
+  if (!match) return json({ error: "JPG, PNG বা WebP image দিন" }, 400);
+  if (match[2].length > MAX_OCR_IMAGE_CHARS) return json({ error: "ছবিটি সর্বোচ্চ ৭.৫ MB হতে পারবে" }, 413);
+
+  const prompt = `এই চাকরির circular image-এর বাংলা/ইংরেজি লেখা পড়ে শুধুমাত্র valid JSON দিন। কোনো তথ্য অনুমান করবেন না; অজানা তথ্য null, 0 বা [] রাখুন। প্রতিটি পদ posts array-তে দিন। পদসংখ্যা না থাকলে count:null, সরকারি grade না থাকলে salaryGrade:null এবং বেতন লেখা আকারে থাকলে salaryText ব্যবহার করুন। title, organizationName, deadline, applicationStartDate, applyLink, applicationFee, serviceCharge, posts, content, seoTitle, metaDescription, focusKeyword ও tags পূরণ করুন। SEO title সর্বোচ্চ ৬৫ অক্ষর এবং metaDescription ১৪০–১৬০ অক্ষরের রাখুন। applyServiceEnabled:false ও status:draft রাখুন। JSON-এর বাইরে কোনো লেখা দেবেন না। Structure: {"title":"","slug":"","category":"govt","content":"","deadline":null,"applicationStartDate":null,"applyLink":null,"organizationName":"","employmentType":"","location":{"addressLocality":"বাংলাদেশ","addressRegion":"","streetAddress":"","postalCode":""},"baseSalary":{"grade":null,"currency":"BDT","minValue":null,"maxValue":null,"unitText":"মাসিক"},"applyServiceEnabled":false,"applicationFee":0,"serviceCharge":0,"posts":[{"name":"","count":null,"district":"ALL","districts":[],"salaryGrade":null,"salaryText":"","salaryMin":null,"salaryMax":null,"applicationFee":0,"serviceCharge":0}],"seoTitle":"","metaDescription":"","focusKeyword":"","tags":[],"status":"draft"}`;
+  const aiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: prompt }, { inline_data: { mime_type: match[1], data: match[2] } }] }],
+      generationConfig: { response_mime_type: "application/json", temperature: 0.1 },
+    }),
+  });
+  if (!aiRes.ok) return json({ error: "OCR AI service থেকে উত্তর পাওয়া যায়নি" }, 502);
+  const aiBody = await aiRes.json();
+  const raw = aiBody?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("").trim();
+  if (!raw) return json({ error: "ছবি থেকে তথ্য পড়া যায়নি" }, 422);
+  try {
+    const parsed = JSON.parse(raw.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim());
+    if (!parsed.title) return json({ error: "ছবি থেকে চাকরির শিরোনাম শনাক্ত করা যায়নি" }, 422);
+    return json(parsed);
+  } catch {
+    return json({ error: "OCR response valid JSON নয়" }, 502);
+  }
 }
 
 const isValidMobile = (m) => /^01[3-9]\d{8}$/.test(String(m || ""));
@@ -979,6 +1010,11 @@ export default {
         const url = new URL(request.url);
     const path = url.pathname;
     const isAdminToken = request.headers.get("Authorization") === `Bearer ${env.ADMIN_TOKEN}`;
+
+    if (path === "/api/admin/ai/extract-job-image" && request.method === "POST") {
+      if (!isAdminToken) return text("Unauthorized", 401);
+      return handleAdminCircularOcr(request, env);
+    }
 
     // ... (বাকি সব আগের রুট যেমন ছিল তেমন থাকবে) ...
 
