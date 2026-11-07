@@ -67,7 +67,8 @@ const JOB_JSON_INSTRUCTION = `চাকরির circular-এর তথ্য �
 
 async function generateJobJson(env, sourceParts) {
   if (!env.GEMINI_API_KEY) return { error: "OCR/AI service configured নয়", status: 503 };
-  const aiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`, {
+  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+  const aiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -75,10 +76,17 @@ async function generateJobJson(env, sourceParts) {
       generationConfig: { responseMimeType: "application/json", temperature: 0.1 },
     }),
   });
-  if (!aiRes.ok) return { error: "AI service থেকে উত্তর পাওয়া যায়নি", status: 502 };
+  if (!aiRes.ok) {
+    const detail = await aiRes.json().catch(() => null);
+    const apiMessage = String(detail?.error?.message || "").slice(0, 180);
+    return { error: `AI service error (${aiRes.status})${apiMessage ? `: ${apiMessage}` : ""}`, status: 502 };
+  }
   const aiBody = await aiRes.json();
   const raw = aiBody?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("").trim();
-  if (!raw) return { error: "AI কোনো উত্তর দেয়নি", status: 422 };
+  if (!raw) {
+    const finish = aiBody?.candidates?.[0]?.finishReason || "unknown";
+    return { error: `AI কোনো text response দেয়নি (finish: ${finish})`, status: 422 };
+  }
   try {
     const parsed = JSON.parse(raw.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim());
     if (!parsed.title || !Array.isArray(parsed.posts)) return { error: "AI response-এ title বা posts নেই", status: 422 };
